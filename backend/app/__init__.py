@@ -1,0 +1,2 @@
+"""Law RAG application package."""
+
