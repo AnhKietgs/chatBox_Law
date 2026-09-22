@@ -27,6 +27,12 @@ def test_unknown_citation_forces_abstention():
     assert validate_model_answer(raw, [candidate()], date.today()).status == "abstained"
 
 
+def test_question_echo_forces_abstention():
+    question = "Luật hôn nhân và gia đình"
+    raw = json.dumps({"answer": question, "claims": [{"text": "Có giới hạn 8%.", "citation_ids": ["S1"]}]})
+    assert validate_model_answer(raw, [candidate()], date.today(), question).status == "abstained"
+
+
 def test_assistant_message_wrapper_is_unwrapped_before_validation():
     answer = {"answer": "Có giới hạn.", "claims": [{"text": "Có giới hạn 8%.", "citation_ids": ["S1"]}]}
     raw = json.dumps({"role": "assistant", "content": json.dumps(answer)})

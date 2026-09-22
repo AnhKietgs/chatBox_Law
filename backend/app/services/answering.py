@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import logging
+import re
 from datetime import date
 from dataclasses import dataclass
 from time import perf_counter
@@ -12,8 +13,20 @@ from ..schemas import ChatResponse, Citation, Claim
 if TYPE_CHECKING:
     from .retrieval import RetrievedProvision
 
-ABSTENTION = "Tôi chưa có đủ căn cứ pháp lý đã được duyệt để trả lời chính xác câu hỏi này. Vui lòng nêu rõ tình huống, thời điểm áp dụng hoặc tham khảo chuyên gia pháp lý."
+ABSTENTION = "Tôi chưa có đủ thông tin để trả lời câu hỏi này."
 logger = logging.getLogger(__name__)
+
+
+def remove_internal_source_labels(text: str) -> str:
+    """Source IDs are for backend citation validation, never for end users."""
+    return re.sub(r"\s*[\(\[]\s*S\d+(?:\s*[,;]\s*S\d+)*\s*[\)\]]", "", text).strip()
+
+
+def is_question_echo(answer: str, question: str) -> bool:
+    """A model repeating the question is not a grounded legal answer."""
+    normalized_answer = re.sub(r"[^\w]+", "", answer.casefold())
+    normalized_question = re.sub(r"[^\w]+", "", question.casefold())
+    return len(normalized_question) >= 8 and normalized_answer == normalized_question
 
 
 class ModelClaim(BaseModel):
@@ -50,7 +63,7 @@ def citation_from(item: RetrievedProvision) -> Citation:
     )
 
 
-def validate_model_answer(raw: str, retrieved: list[RetrievedProvision], as_of: date) -> ChatResponse:
+def validate_model_answer(raw: str, retrieved: list[RetrievedProvision], as_of: date, question: str | None = None) -> ChatResponse:
     """Reject an answer unless every generated claim cites a retrieved provision."""
     try:
         cleaned = raw.strip()
@@ -69,6 +82,9 @@ def validate_model_answer(raw: str, retrieved: list[RetrievedProvision], as_of: 
     except (json.JSONDecodeError, ValidationError) as exc:
         logger.warning("Rejected LLM output: invalid JSON or answer schema (%s)", exc)
         return abstain(as_of)
+    if question and is_question_echo(proposed.answer, question):
+        logger.warning("Rejected LLM output: answer merely repeats the question")
+        return abstain(as_of)
     available = {f"S{index}": item for index, item in enumerate(retrieved, start=1)}
     cited_source_ids = {citation_id.upper() for claim in proposed.claims for citation_id in claim.citation_ids}
     if not cited_source_ids or not cited_source_ids.issubset(available):
@@ -77,7 +93,7 @@ def validate_model_answer(raw: str, retrieved: list[RetrievedProvision], as_of: 
     citations = [citation_from(available[source_id]) for source_id in cited_source_ids]
     return ChatResponse(
         status="grounded",
-        answer=proposed.answer,
+        answer=remove_internal_source_labels(proposed.answer),
         claims=[Claim(text=claim.text, citation_ids=[available[source_id.upper()].provision.id for source_id in claim.citation_ids]) for claim in proposed.claims],
         citations=citations,
         warnings=[*proposed.warnings, "Thông tin có tính tham khảo, không thay thế tư vấn pháp lý cho tình huống cụ thể."],
@@ -132,6 +148,9 @@ class GroundedAnswerService:
             "Bạn là trợ lý tra cứu pháp luật Việt Nam. Chỉ dùng các nguồn được cung cấp; "
             "không suy diễn và không viện dẫn nguồn ngoài. Phải tuân thủ JSON Schema đã được cung cấp. "
             "citation_ids phải là source_id ngắn từ nguồn (ví dụ S1), không được tự tạo mã khác. "
+            "S1, S2 và mọi source_id chỉ được đặt trong trường citation_ids; tuyệt đối không viết chúng "
+            "trong answer, claim text hoặc bất kỳ nội dung hiển thị cho người dùng. "
+            "Nếu nguồn được cung cấp không trực tiếp trả lời câu hỏi, hãy trả về {} để hệ thống từ chối an toàn; "
             "Không viết Markdown, giải thích ngoài JSON hoặc phần suy luận."
         )
         user_prompt = (
@@ -175,7 +194,7 @@ class GroundedAnswerService:
             return AnswerGeneration(abstain(as_of), (perf_counter() - llm_started) * 1000, 0)
         llm_ms = (perf_counter() - llm_started) * 1000
         validation_started = perf_counter()
-        answer = validate_model_answer(raw, retrieved, as_of)
+        answer = validate_model_answer(raw, retrieved, as_of, question)
         if answer.status == "grounded" and not claims_are_supported(answer, retrieved):
             logger.warning("Rejected LLM output: a claim is not supported by its cited excerpt")
             answer = abstain(as_of)

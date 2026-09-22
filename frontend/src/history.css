@@ -1,0 +1,16 @@
+.chat-shell { width:min(1240px, calc(100% - 2rem)); margin:auto; display:grid; grid-template-columns:260px minmax(0, 1fr); gap:1.25rem; align-items:start; }
+.chat-shell .chat-page { width:100%; margin:0; }
+.chat-history { position:sticky; top:1rem; margin-top:1.25rem; background:#fff; border-radius:14px; padding:1rem; box-shadow:0 6px 25px #20362a0f; max-height:calc(100vh - 2rem); display:flex; flex-direction:column; }
+.history-heading { display:flex; align-items:center; justify-content:space-between; gap:.5rem; }
+.history-heading h2 { margin:0; font-size:1rem; }
+.history-clear, .history-delete { background:transparent; color:#0b6049; padding:.25rem; font-size:.78rem; }
+.chat-history ul { padding:0; margin:.8rem 0; list-style:none; overflow:auto; display:grid; gap:.35rem; }
+.chat-history li { display:grid; grid-template-columns:minmax(0, 1fr) auto; align-items:center; border:1px solid #e3e9e5; border-radius:8px; }
+.chat-history li.selected { border-color:#0b6049; background:#f2f8f4; }
+.history-open { min-width:0; color:#15241d; background:transparent; padding:.55rem; text-align:left; font-weight:500; display:grid; gap:.2rem; }
+.history-open span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.history-open small { font-size:.72rem; }
+.history-delete { font-size:1.3rem; line-height:1; padding:.45rem .55rem; }
+.history-empty, .history-note { color:#5d6962; font-size:.85rem; }
+.history-note { border-top:1px solid #edf0ed; padding-top:.75rem; margin:.2rem 0 0; }
+@media (max-width:850px) { .chat-shell { display:block; } .chat-history { position:static; margin-top:0; margin-bottom:1rem; max-height:250px; } }

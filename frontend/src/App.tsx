@@ -2,6 +2,27 @@ import { FormEvent, useEffect, useState } from 'react'
 import { ask, job, login, publish, reviewVersion, uploadVersion, versions, withdraw } from './api'
 import type { Answer, Citation, Job, Review, Version } from './types'
 
+const HISTORY_KEY = 'lawrag_chat_history_v1'
+const HISTORY_LIMIT = 20
+
+type HistoryEntry = {
+  id: string
+  question: string
+  asOfDate: string
+  answer: Answer
+  endToEndMs: number
+  createdAt: string
+}
+
+function loadHistory(): HistoryEntry[] {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]')
+    return Array.isArray(value) ? value as HistoryEntry[] : []
+  } catch {
+    return []
+  }
+}
+
 function Locator({ citation }: { citation: Citation }) {
   return <span>Điều {citation.article}{citation.clause ? ` · Khoản ${citation.clause}` : ''}{citation.point ? ` · Điểm ${citation.point}` : ''}</span>
 }
@@ -19,24 +40,48 @@ function Chat() {
   const [asOfDate, setAsOfDate] = useState('')
   const [answer, setAnswer] = useState<Answer | null>(null)
   const [endToEndMs, setEndToEndMs] = useState<number | null>(null)
+  const [history, setHistory] = useState<HistoryEntry[]>(loadHistory)
+  const [selectedHistoryId, setSelectedHistoryId] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  // Citations are already server-validated. Keep this filter in the UI as a
+  // second guard so the user only sees sources that support a generated claim.
+  const citedIds = answer ? new Set(answer.claims.flatMap(claim => claim.citation_ids)) : new Set<string>()
+  const supportingCitations = answer ? answer.citations.filter(citation => citedIds.has(citation.id)) : []
+  useEffect(() => { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)) }, [history])
   const submit = async () => {
     setLoading(true); setError(''); setAnswer(null); setEndToEndMs(null)
     try {
       const result = await ask(question, asOfDate)
       setAnswer(result.answer)
       setEndToEndMs(result.endToEndMs)
+      const entry: HistoryEntry = {
+        id: crypto.randomUUID(), question: question.trim(), asOfDate, answer: result.answer,
+        endToEndMs: result.endToEndMs, createdAt: new Date().toISOString(),
+      }
+      setHistory(items => [entry, ...items].slice(0, HISTORY_LIMIT))
+      setSelectedHistoryId(entry.id)
       setQuestion('')
     } catch (err) { setError(err instanceof Error ? err.message : 'Đã có lỗi xảy ra') } finally { setLoading(false) }
   }
-  return <main className="chat-page">
-    <nav><span className="brand">Luật Thương mại RAG</span><a href="#admin">Quản trị kho luật</a></nav>
-    <section className="hero"><p className="eyebrow">Tra cứu có căn cứ</p><h1>Chatbot hỏi đáp về hợp đồng thương mại, mua bán hàng hóa và phạt vi phạm.</h1></section>
+  const openHistory = (entry: HistoryEntry) => {
+    setAnswer(entry.answer); setEndToEndMs(entry.endToEndMs); setSelectedHistoryId(entry.id); setError('')
+  }
+  const deleteHistory = (id: string) => {
+    setHistory(items => items.filter(entry => entry.id !== id))
+    if (selectedHistoryId === id) { setAnswer(null); setEndToEndMs(null); setSelectedHistoryId('') }
+  }
+  return <div className="chat-shell">
+    <aside className="chat-history" aria-label="Lịch sử câu hỏi">
+      <div className="history-heading"><h2>Lịch sử hỏi đáp</h2>{history.length > 0 && <button className="history-clear" type="button" onClick={() => { setHistory([]); setAnswer(null); setEndToEndMs(null); setSelectedHistoryId('') }}>Xóa tất cả</button>}</div>
+      {history.length === 0 ? <p className="history-empty">Chưa có câu hỏi nào.</p> : <ul>{history.map(entry => <li key={entry.id} className={entry.id === selectedHistoryId ? 'selected' : ''}><button className="history-open" type="button" onClick={() => openHistory(entry)}><span>{entry.question}</span><small>{entry.answer.status === 'grounded' ? 'Có căn cứ' : 'Chưa đủ căn cứ'}</small></button><button className="history-delete" type="button" aria-label={`Xóa câu hỏi: ${entry.question}`} onClick={() => deleteHistory(entry.id)}>×</button></li>)}</ul>}
+      <p className="history-note">Lưu cục bộ trên trình duyệt này.</p>
+    </aside>
+    <main className="chat-page">
+    <nav><span className="brand">ChatBot Luật RAG</span><a href="#admin">Quản trị kho luật</a></nav>
     <form className="ask" onSubmit={event => { event.preventDefault(); void submit() }}>
       <label>Câu hỏi pháp lý<textarea value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (!loading && question.trim().length >= 8) void submit() } }} minLength={8} required placeholder="Ví dụ: Mức phạt vi phạm hợp đồng mua bán hàng hóa tối đa là bao nhiêu?" /></label>
       <small>Enter để hỏi · Shift + Enter để xuống dòng</small>
-      <label>Thời điểm áp dụng <small>Để trống để dùng quy định hiện hành</small><input type="date" value={asOfDate} onChange={e => setAsOfDate(e.target.value)} /></label>
       <button disabled={loading}>{loading ? 'Đang đối chiếu nguồn…' : 'Hỏi pháp luật'}</button>
     </form>
     {error && <p className="error">{error}</p>}
@@ -44,13 +89,13 @@ function Chat() {
       <div className="answer-state">{answer.status === 'grounded' ? `Có căn cứ · áp dụng ${answer.applied_as_of_date}` : 'Chưa đủ căn cứ'}</div>
       {endToEndMs !== null && <p className="latency">Phản hồi trong {(endToEndMs / 1000).toFixed(2)} giây · Server xử lý {((answer.latency?.total_ms ?? 0) / 1000).toFixed(2)} giây</p>}
       <p className="answer-text">{answer.answer}</p>
-      {answer.claims.map((claim, i) => <div className="claim" key={i}><span>{claim.text}</span><div>{claim.citation_ids.map(id => { const c = answer.citations.find(item => item.id === id); return c && <a className="chip" href={`#cite-${id}`} key={id}><Locator citation={c} /></a> })}</div></div>)}
-      {answer.citations.length > 0 && <><h2>Căn cứ pháp lý</h2><div className="citations">{answer.citations.map(c => <div id={`cite-${c.id}`} key={c.id}><CitationCard citation={c} /></div>)}</div></>}
+      {supportingCitations.length > 0 && <><h2>Căn cứ pháp lý</h2><div className="citations">{supportingCitations.map(c => <div id={`cite-${c.id}`} key={c.id}><CitationCard citation={c} /></div>)}</div></>}
       {answer.warnings.map((warning, i) => <p className="warning" key={i}>{warning}</p>)}
       {answer.latency && <details className="latency-breakdown"><summary>Chi tiết độ trễ máy chủ</summary><ul><li>Retrieval: {answer.latency.retrieval_ms.toFixed(0)} ms</li><li>Rerank: {answer.latency.rerank_ms.toFixed(0)} ms</li><li>LLM: {answer.latency.llm_ms.toFixed(0)} ms</li><li>Kiểm tra citation: {answer.latency.citation_validation_ms.toFixed(0)} ms</li></ul></details>}
     </section>}
     <footer>Thông tin tra cứu mang tính tham khảo, không thay thế tư vấn luật sư cho tình huống cụ thể.</footer>
-  </main>
+    </main>
+  </div>
 }
 
 function Admin() {
