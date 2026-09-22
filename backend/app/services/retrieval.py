@@ -1,6 +1,7 @@
 from dataclasses import dataclass, replace
 from datetime import date
 from functools import lru_cache
+import logging
 from time import perf_counter
 from uuid import UUID
 from sqlalchemy import select
@@ -8,7 +9,10 @@ from sqlalchemy.orm import Session
 from ..models import LegalProvision, LegalVersion, LegalDocument, VersionStatus
 from ..config import get_settings
 from ..versioning import is_effective
+from .query_expansion import expand_short_commercial_query
 from .vector_store import HybridVectorStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,32 @@ class RetrievalResult:
     rerank_ms: float
 
 
+def log_top_k(stage: str, question: str, candidates: list[RetrievedProvision], score_label: str) -> None:
+    """Development-only, human-readable retrieval trace for relevance debugging."""
+    settings = get_settings()
+    if not settings.retrieval_debug_logs:
+        return
+    top_k = max(1, settings.retrieval_debug_top_k)
+    logger.info("Retrieval %s: query=%r, candidates=%d", stage, question[:500], len(candidates))
+    for rank, item in enumerate(candidates[:top_k], start=1):
+        excerpt = " ".join(item.provision.content.split())
+        if len(excerpt) > 280:
+            excerpt = f"{excerpt[:277]}..."
+        logger.info(
+            "Retrieval %s #%d %s=%.4f | %s | %s | Điều %s, Khoản %s, Điểm %s | %s",
+            stage,
+            rank,
+            score_label,
+            item.score,
+            item.document.code,
+            item.version.version_label,
+            item.provision.article_no,
+            item.provision.clause_no or "-",
+            item.provision.point_label or "-",
+            excerpt,
+        )
+
+
 class LegalRetriever:
     def __init__(self, db: Session):
         self.db = db
@@ -35,7 +65,10 @@ class LegalRetriever:
 
     def retrieve_with_metrics(self, question: str, as_of: date, limit: int = 8) -> RetrievalResult:
         retrieval_started = perf_counter()
-        points = HybridVectorStore().search(question, as_of.isoformat(), limit=limit * 2)
+        expanded = expand_short_commercial_query(question)
+        if expanded.applied and get_settings().retrieval_debug_logs:
+            logger.info("Retrieval query expansion: original=%r expanded=%r", expanded.original, expanded.retrieval_query)
+        points = HybridVectorStore().search(expanded.retrieval_query, as_of.isoformat(), limit=limit * 2)
         ids = [UUID(str(point.id)) for point in points]
         scores = {UUID(str(point.id)): float(point.score) for point in points}
         if not ids:
@@ -51,10 +84,12 @@ class LegalRetriever:
             for provision, version, document in rows
             if is_effective(version.effective_from, version.effective_to, as_of)
         ]
+        log_top_k("hybrid-recall", question, valid, "rrf_score")
         retrieval_ms = (perf_counter() - retrieval_started) * 1000
         # bge-reranker-v2-m3 is deliberately applied after hybrid recall.
         rerank_started = perf_counter()
         provisions = Reranker().rerank(question, valid)[:limit]
+        log_top_k("reranked", question, provisions, "reranker_score")
         return RetrievalResult(provisions, retrieval_ms, (perf_counter() - rerank_started) * 1000)
 
 
