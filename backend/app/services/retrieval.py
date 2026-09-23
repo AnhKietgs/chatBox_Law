@@ -2,6 +2,7 @@ from dataclasses import dataclass, replace
 from datetime import date
 from functools import lru_cache
 import logging
+import re
 from time import perf_counter
 from uuid import UUID
 from sqlalchemy import select
@@ -30,6 +31,7 @@ class RetrievalResult:
     provisions: list[RetrievedProvision]
     retrieval_ms: float
     rerank_ms: float
+    minimum_score: float
 
 
 def log_top_k(stage: str, question: str, candidates: list[RetrievedProvision], score_label: str) -> None:
@@ -80,7 +82,7 @@ class LegalRetriever:
         ids = [UUID(str(point.id)) for point in points]
         scores = {UUID(str(point.id)): float(point.score) for point in points}
         if not ids:
-            return RetrievalResult([], (perf_counter() - retrieval_started) * 1000, 0)
+            return RetrievalResult([], (perf_counter() - retrieval_started) * 1000, 0, get_settings().confidence_threshold)
         rows = self.db.execute(
             select(LegalProvision, LegalVersion, LegalDocument)
             .join(LegalVersion, LegalProvision.version_id == LegalVersion.id)
@@ -96,13 +98,28 @@ class LegalRetriever:
         retrieval_ms = (perf_counter() - retrieval_started) * 1000
         # bge-reranker-v2-m3 is deliberately applied after hybrid recall.
         rerank_started = perf_counter()
-        provisions = Reranker().rerank(retrieval_query, valid)[:limit]
+        # Short follow-ups such as “nếu vi phạm thì sao?” have little lexical
+        # overlap with a provision on their own. Their bounded conversation
+        # context resolves the reference, so use a separately calibrated
+        # threshold without weakening standalone legal queries.
+        is_short_follow_up = bool(conversation_context) and len(re.findall(r"\w+", question)) <= 7
+        minimum_score = (
+            get_settings().conversation_confidence_threshold
+            if is_short_follow_up
+            else get_settings().confidence_threshold
+        )
+        logger.info(
+            "Retrieval reranker threshold=%.2f mode=%s",
+            minimum_score,
+            "contextual-follow-up" if is_short_follow_up else "standalone",
+        )
+        provisions = Reranker().rerank(retrieval_query, valid, minimum_score=minimum_score)[:limit]
         log_top_k("reranked", question, provisions, "reranker_score")
-        return RetrievalResult(provisions, retrieval_ms, (perf_counter() - rerank_started) * 1000)
+        return RetrievalResult(provisions, retrieval_ms, (perf_counter() - rerank_started) * 1000, minimum_score)
 
 
 class Reranker:
-    def rerank(self, question: str, candidates: list[RetrievedProvision]) -> list[RetrievedProvision]:
+    def rerank(self, question: str, candidates: list[RetrievedProvision], minimum_score: float | None = None) -> list[RetrievedProvision]:
         if not candidates:
             return []
         passages = [
@@ -116,7 +133,7 @@ class Reranker:
         )
         if isinstance(scores, float):
             scores = [scores]
-        threshold = get_settings().confidence_threshold
+        threshold = minimum_score if minimum_score is not None else get_settings().confidence_threshold
         ranked = sorted(zip(scores, candidates), key=lambda pair: pair[0], reverse=True)
         scored = [replace(item, score=float(score)) for score, item in ranked]
         log_top_k("reranker-raw", question, scored, "reranker_score")

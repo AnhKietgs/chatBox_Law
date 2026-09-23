@@ -110,9 +110,10 @@ def abstain(as_of: date) -> ChatResponse:
     return ChatResponse(status="abstained", answer=ABSTENTION, warnings=["Không suy đoán khi không có căn cứ Điều/Khoản/Điểm."], applied_as_of_date=as_of)
 
 
-def extractive_fallback(retrieved: list[RetrievedProvision], as_of: date) -> ChatResponse:
+def extractive_fallback(retrieved: list[RetrievedProvision], as_of: date, minimum_score: float | None = None) -> ChatResponse:
     """Return a verified provision verbatim when a small LLM fails despite strong recall."""
-    if not retrieved or retrieved[0].score < get_settings().extractive_fallback_threshold:
+    threshold = minimum_score if minimum_score is not None else get_settings().extractive_fallback_threshold
+    if not retrieved or retrieved[0].score < threshold:
         return abstain(as_of)
     item = retrieved[0]
     citation = citation_from(item)
@@ -161,7 +162,7 @@ def claims_are_supported(answer: ChatResponse, retrieved: list[RetrievedProvisio
 
 
 class GroundedAnswerService:
-    async def generate(self, question: str, retrieved: list[RetrievedProvision], as_of: date, conversation_context: str = "") -> AnswerGeneration:
+    async def generate(self, question: str, retrieved: list[RetrievedProvision], as_of: date, conversation_context: str = "", fallback_minimum_score: float | None = None) -> AnswerGeneration:
         if not retrieved:
             logger.info("Abstaining because retrieval returned no eligible provision")
             return AnswerGeneration(abstain(as_of), 0, 0)
@@ -222,16 +223,16 @@ class GroundedAnswerService:
                         body.get("done_reason"),
                         body.get("eval_count"),
                     )
-                    return AnswerGeneration(extractive_fallback(retrieved, as_of), (perf_counter() - llm_started) * 1000, 0)
+                    return AnswerGeneration(extractive_fallback(retrieved, as_of, fallback_minimum_score), (perf_counter() - llm_started) * 1000, 0)
         except Exception as exc:
             logger.warning("Ollama generation failed; returning safe abstention: %s", exc)
-            return AnswerGeneration(extractive_fallback(retrieved, as_of), (perf_counter() - llm_started) * 1000, 0)
+            return AnswerGeneration(extractive_fallback(retrieved, as_of, fallback_minimum_score), (perf_counter() - llm_started) * 1000, 0)
         llm_ms = (perf_counter() - llm_started) * 1000
         validation_started = perf_counter()
         answer = validate_model_answer(raw, retrieved, as_of, question)
         if answer.status == "abstained":
-            answer = extractive_fallback(retrieved, as_of)
+            answer = extractive_fallback(retrieved, as_of, fallback_minimum_score)
         elif not claims_are_supported(answer, retrieved):
             logger.warning("Rejected LLM output: a claim is not supported by its cited excerpt")
-            answer = extractive_fallback(retrieved, as_of)
+            answer = extractive_fallback(retrieved, as_of, fallback_minimum_score)
         return AnswerGeneration(answer, llm_ms, (perf_counter() - validation_started) * 1000)

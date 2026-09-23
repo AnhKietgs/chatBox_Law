@@ -13,6 +13,10 @@
 .history-open span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .history-open small { font-size:.72rem; }
 .history-delete { font-size:1.3rem; line-height:1; padding:.45rem .55rem; }
+.history-questions { grid-column:1 / -1; border-top:1px solid #e3e9e5; padding:.35rem .55rem .55rem; color:#45544b; font-size:.78rem; }
+.history-questions summary { cursor:pointer; color:#0b6049; }
+.history-questions ol { margin:.45rem 0 0; padding-left:1.1rem; display:grid; gap:.35rem; }
+.history-questions li { display:list-item; border:0; padding:0; }
 .history-empty, .history-note { color:#5d6962; font-size:.85rem; }
 .history-note { border-top:1px solid #edf0ed; padding-top:.75rem; margin:.2rem 0 0; }
 @media (max-width:850px) { .chat-shell { display:block; } .chat-history { position:static; margin-top:0; margin-bottom:1rem; max-height:250px; } }

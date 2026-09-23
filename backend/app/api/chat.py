@@ -70,7 +70,13 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
     conversation_context = build_conversation_context(reversed(prior_messages), settings.conversation_context_max_chars)
     retrieval = LegalRetriever(db).retrieve_with_metrics(payload.question, applied_date, conversation_context=conversation_context)
     logger.info("Chat retrieval returned %d grounded provisions for %s", len(retrieval.provisions), applied_date.isoformat())
-    generation = await GroundedAnswerService().generate(payload.question, retrieval.provisions, applied_date, conversation_context)
+    generation = await GroundedAnswerService().generate(
+        payload.question,
+        retrieval.provisions,
+        applied_date,
+        conversation_context,
+        fallback_minimum_score=retrieval.minimum_score,
+    )
     generation.answer.conversation_id = save_turn(db, conversation, payload.question, generation.answer.answer)
     generation.answer.latency = LatencyBreakdown(
         retrieval_ms=round(retrieval.retrieval_ms, 1),

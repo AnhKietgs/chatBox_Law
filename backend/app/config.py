@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # Calibrated against Vietnamese legal retrieval: a direct Article 301 match
     # scores about 0.51 while the next unrelated candidate is near 0.12.
     confidence_threshold: float = 0.50
+    conversation_confidence_threshold: float = 0.30
     claim_support_threshold: float = 0.65
     extractive_fallback_threshold: float = 0.50
     index_batch_size: int = 32
