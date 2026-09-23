@@ -55,6 +55,7 @@ class ChatResponse(BaseModel):
     warnings: list[str] = []
     applied_as_of_date: date
     latency: LatencyBreakdown | None = None
+    conversation_id: UUID | None = None
 
 
 class VersionSummary(BaseModel):

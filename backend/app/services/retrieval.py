@@ -10,9 +10,11 @@ from ..models import LegalProvision, LegalVersion, LegalDocument, VersionStatus
 from ..config import get_settings
 from ..versioning import is_effective
 from .query_expansion import expand_short_commercial_query
+from .conversation import contextual_retrieval_query
 from .vector_store import HybridVectorStore
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 @dataclass(frozen=True)
@@ -60,12 +62,13 @@ class LegalRetriever:
     def __init__(self, db: Session):
         self.db = db
 
-    def retrieve(self, question: str, as_of: date, limit: int = 8) -> list[RetrievedProvision]:
-        return self.retrieve_with_metrics(question, as_of, limit).provisions
+    def retrieve(self, question: str, as_of: date, limit: int = 8, conversation_context: str = "") -> list[RetrievedProvision]:
+        return self.retrieve_with_metrics(question, as_of, limit, conversation_context).provisions
 
-    def retrieve_with_metrics(self, question: str, as_of: date, limit: int = 8) -> RetrievalResult:
+    def retrieve_with_metrics(self, question: str, as_of: date, limit: int = 8, conversation_context: str = "") -> RetrievalResult:
         retrieval_started = perf_counter()
-        expanded = expand_short_commercial_query(question)
+        retrieval_query = contextual_retrieval_query(question, conversation_context)
+        expanded = expand_short_commercial_query(retrieval_query)
         if expanded.applied and get_settings().retrieval_debug_logs:
             logger.info("Retrieval query expansion: original=%r expanded=%r", expanded.original, expanded.retrieval_query)
         points = HybridVectorStore().search(expanded.retrieval_query, as_of.isoformat(), limit=limit * 2)
@@ -88,7 +91,7 @@ class LegalRetriever:
         retrieval_ms = (perf_counter() - retrieval_started) * 1000
         # bge-reranker-v2-m3 is deliberately applied after hybrid recall.
         rerank_started = perf_counter()
-        provisions = Reranker().rerank(question, valid)[:limit]
+        provisions = Reranker().rerank(retrieval_query, valid)[:limit]
         log_top_k("reranked", question, provisions, "reranker_score")
         return RetrievalResult(provisions, retrieval_ms, (perf_counter() - rerank_started) * 1000)
 

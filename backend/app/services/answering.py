@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 ABSTENTION = "Tôi chưa có đủ thông tin để trả lời câu hỏi này."
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def remove_internal_source_labels(text: str) -> str:
@@ -36,8 +37,9 @@ class ModelClaim(BaseModel):
 
 class ModelAnswer(BaseModel):
     answer: str = Field(min_length=1)
-    claims: list[ModelClaim] = Field(min_length=1)
+    claims: list[ModelClaim] = []
     warnings: list[str] = []
+    abstain: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,9 @@ def validate_model_answer(raw: str, retrieved: list[RetrievedProvision], as_of: 
         return abstain(as_of)
     if question and is_question_echo(proposed.answer, question):
         logger.warning("Rejected LLM output: answer merely repeats the question")
+        return abstain(as_of)
+    if proposed.abstain or not proposed.claims:
+        logger.info("LLM abstained because the retrieved sources did not directly support the question")
         return abstain(as_of)
     available = {f"S{index}": item for index, item in enumerate(retrieved, start=1)}
     cited_source_ids = {citation_id.upper() for claim in proposed.claims for citation_id in claim.citation_ids}
@@ -134,7 +139,7 @@ def claims_are_supported(answer: ChatResponse, retrieved: list[RetrievedProvisio
 
 
 class GroundedAnswerService:
-    async def generate(self, question: str, retrieved: list[RetrievedProvision], as_of: date) -> AnswerGeneration:
+    async def generate(self, question: str, retrieved: list[RetrievedProvision], as_of: date, conversation_context: str = "") -> AnswerGeneration:
         if not retrieved:
             logger.info("Abstaining because retrieval returned no eligible provision")
             return AnswerGeneration(abstain(as_of), 0, 0)
@@ -150,11 +155,16 @@ class GroundedAnswerService:
             "citation_ids phải là source_id ngắn từ nguồn (ví dụ S1), không được tự tạo mã khác. "
             "S1, S2 và mọi source_id chỉ được đặt trong trường citation_ids; tuyệt đối không viết chúng "
             "trong answer, claim text hoặc bất kỳ nội dung hiển thị cho người dùng. "
-            "Nếu nguồn được cung cấp không trực tiếp trả lời câu hỏi, hãy trả về {} để hệ thống từ chối an toàn; "
+            "Lịch sử hội thoại chỉ dùng để hiểu các từ tham chiếu như 'điều đó' hoặc 'trường hợp trên'; "
+            "không phải căn cứ pháp lý và không được dùng để tạo kết luận nếu nguồn không hỗ trợ. "
+            "Nếu nguồn được cung cấp không trực tiếp trả lời câu hỏi, hãy trả về JSON hợp lệ với "
+            "abstain=true, answer='Không đủ căn cứ pháp lý từ các nguồn được cung cấp.', claims=[] và warnings=[]. "
             "Không viết Markdown, giải thích ngoài JSON hoặc phần suy luận."
         )
         user_prompt = (
-            f"Ngày áp dụng: {as_of.isoformat()}. Câu hỏi: {question}\n"
+            f"Ngày áp dụng: {as_of.isoformat()}. "
+            f"Lịch sử hội thoại (không phải căn cứ pháp lý): {conversation_context or '(không có)'}\n"
+            f"Câu hỏi hiện tại: {question}\n"
             f"Nguồn: {json.dumps(sources, ensure_ascii=False)}"
         )
         settings = get_settings()

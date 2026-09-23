@@ -1,16 +1,22 @@
 from datetime import date
 import logging
 from time import perf_counter
-from fastapi import APIRouter, Depends, Request
+from uuid import UUID
+from fastapi import APIRouter, Depends, Request, Response, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from ..database import get_db
+from ..config import get_settings
 from ..rate_limit import enforce_public_rate_limit
 from ..schemas import ChatQuery, ChatResponse, LatencyBreakdown
 from ..services.answering import GroundedAnswerService
+from ..services.conversation import build_conversation_context
 from ..services.retrieval import LegalRetriever
+from ..models import ChatMessage, Conversation
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 @router.post("/query", response_model=ChatResponse)
@@ -18,9 +24,28 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
     started = perf_counter()
     enforce_public_rate_limit(request)
     applied_date = payload.as_of_date or date.today()
-    retrieval = LegalRetriever(db).retrieve_with_metrics(payload.question, applied_date)
+    conversation = db.get(Conversation, payload.conversation_id) if payload.conversation_id else None
+    if conversation is None:
+        conversation = Conversation()
+        db.add(conversation)
+        db.flush()
+    settings = get_settings()
+    prior_messages = list(db.scalars(
+        select(ChatMessage)
+        .where(ChatMessage.conversation_id == conversation.id)
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+        .limit(settings.conversation_context_messages)
+    ))
+    conversation_context = build_conversation_context(reversed(prior_messages), settings.conversation_context_max_chars)
+    retrieval = LegalRetriever(db).retrieve_with_metrics(payload.question, applied_date, conversation_context=conversation_context)
     logger.info("Chat retrieval returned %d grounded provisions for %s", len(retrieval.provisions), applied_date.isoformat())
-    generation = await GroundedAnswerService().generate(payload.question, retrieval.provisions, applied_date)
+    generation = await GroundedAnswerService().generate(payload.question, retrieval.provisions, applied_date, conversation_context)
+    db.add_all([
+        ChatMessage(conversation_id=conversation.id, role="user", content=payload.question),
+        ChatMessage(conversation_id=conversation.id, role="assistant", content=generation.answer.answer),
+    ])
+    db.commit()
+    generation.answer.conversation_id = conversation.id
     generation.answer.latency = LatencyBreakdown(
         retrieval_ms=round(retrieval.retrieval_ms, 1),
         rerank_ms=round(retrieval.rerank_ms, 1),
@@ -37,3 +62,13 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         generation.answer.latency.citation_validation_ms,
     )
     return generation.answer
+
+
+@router.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_conversation(conversation_id: UUID, db: Session = Depends(get_db)) -> Response:
+    """Delete an anonymous conversation and its messages on the user's request."""
+    conversation = db.get(Conversation, conversation_id)
+    if conversation is not None:
+        db.delete(conversation)
+        db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

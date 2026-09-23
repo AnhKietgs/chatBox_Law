@@ -3,7 +3,9 @@
 .chat-history { position:sticky; top:1rem; margin-top:1.25rem; background:#fff; border-radius:14px; padding:1rem; box-shadow:0 6px 25px #20362a0f; max-height:calc(100vh - 2rem); display:flex; flex-direction:column; }
 .history-heading { display:flex; align-items:center; justify-content:space-between; gap:.5rem; }
 .history-heading h2 { margin:0; font-size:1rem; }
-.history-clear, .history-delete { background:transparent; color:#0b6049; padding:.25rem; font-size:.78rem; }
+.history-actions { display:flex; align-items:center; gap:.35rem; }
+.history-new, .history-clear, .history-delete { background:transparent; color:#0b6049; padding:.25rem; font-size:.78rem; }
+.history-new { border:1px solid #bcd4c7; padding:.3rem .45rem; }
 .chat-history ul { padding:0; margin:.8rem 0; list-style:none; overflow:auto; display:grid; gap:.35rem; }
 .chat-history li { display:grid; grid-template-columns:minmax(0, 1fr) auto; align-items:center; border:1px solid #e3e9e5; border-radius:8px; }
 .chat-history li.selected { border-color:#0b6049; background:#f2f8f4; }

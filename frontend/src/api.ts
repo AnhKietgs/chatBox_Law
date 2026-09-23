@@ -25,11 +25,16 @@ async function responseError(response: Response, fallback: string): Promise<Erro
 
 export type AskedAnswer = { answer: Answer; endToEndMs: number }
 
-export async function ask(question: string, asOfDate?: string): Promise<AskedAnswer> {
-  const started = performance.now()
-  const response = await fetch('/api/v1/chat/query', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ question, as_of_date: asOfDate || null }) })
+export async function ask(question: string, asOfDate?: string, conversationId?: string): Promise<AskedAnswer> {
+    const started = performance.now()
+  const response = await fetch('/api/v1/chat/query', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ question, as_of_date: asOfDate || null, conversation_id: conversationId || null }) })
   if (!response.ok) throw await responseError(response, 'Không thể gửi câu hỏi')
   return { answer: await response.json(), endToEndMs: performance.now() - started }
+}
+
+export async function deleteConversation(conversationId: string): Promise<void> {
+  const response = await fetch(`/api/v1/chat/conversations/${conversationId}`, { method: 'DELETE' })
+  if (!response.ok) throw await responseError(response, 'Không thể xóa đoạn chat')
 }
 export async function login(email: string, password: string): Promise<string> {
   const response = await fetch('/api/v1/admin/token', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email, password }) })

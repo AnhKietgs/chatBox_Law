@@ -33,6 +33,11 @@ def test_question_echo_forces_abstention():
     assert validate_model_answer(raw, [candidate()], date.today(), question).status == "abstained"
 
 
+def test_model_can_abstain_with_a_schema_valid_response():
+    raw = json.dumps({"answer": "Không đủ căn cứ pháp lý từ các nguồn được cung cấp.", "claims": [], "warnings": [], "abstain": True})
+    assert validate_model_answer(raw, [candidate()], date.today(), "Câu hỏi ngoài phạm vi").status == "abstained"
+
+
 def test_assistant_message_wrapper_is_unwrapped_before_validation():
     answer = {"answer": "Có giới hạn.", "claims": [{"text": "Có giới hạn 8%.", "citation_ids": ["S1"]}]}
     raw = json.dumps({"role": "assistant", "content": json.dumps(answer)})

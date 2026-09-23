@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     index_batch_size: int = 32
     retrieval_debug_logs: bool = False
     retrieval_debug_top_k: int = 8
+    conversation_context_messages: int = 6
+    conversation_context_max_chars: int = 3000
 
 
 @lru_cache
