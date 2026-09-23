@@ -18,13 +18,17 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "Qwen3.5:2b"
     public_rate_limit_per_minute: int = 20
-    confidence_threshold: float = 0.55
+    # Calibrated against Vietnamese legal retrieval: a direct Article 301 match
+    # scores about 0.51 while the next unrelated candidate is near 0.12.
+    confidence_threshold: float = 0.50
     claim_support_threshold: float = 0.65
+    extractive_fallback_threshold: float = 0.50
     index_batch_size: int = 32
     retrieval_debug_logs: bool = False
     retrieval_debug_top_k: int = 8
     conversation_context_messages: int = 6
     conversation_context_max_chars: int = 3000
+    warm_models_on_startup: bool = True
 
 
 @lru_cache

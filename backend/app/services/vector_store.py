@@ -80,20 +80,29 @@ class HybridVectorStore:
             ],
         )
 
-    def search(self, question: str, as_of_iso: str, limit: int = 16):
+    def search(self, question: str, as_of_iso: str, limit: int = 16, expansion_query: str | None = None):
         self.ensure_collection()
-        dense, sparse = self.embedder.encode([question])
+        queries = [question]
+        if expansion_query and expansion_query != question:
+            queries.append(expansion_query)
+        dense, sparse = self.embedder.encode(queries)
         # Effective-date validation is repeated from PostgreSQL after recall. That
         # is authoritative and handles open-ended versions without Qdrant date
         # serialization assumptions.
         effective_filter = models.Filter(must=[models.FieldCondition(key="status", match=models.MatchValue(value="PUBLISHED"))])
         # Qdrant server-side RRF combines independent dense and sparse rankings.
+        prefetches = []
+        for index in range(len(queries)):
+            # Preserve the original question as an independent ranking. The
+            # optional expanded query only contributes extra recall; it never
+            # replaces the user's wording.
+            prefetches.extend([
+                models.Prefetch(query=dense[index].tolist(), using="dense", filter=effective_filter, limit=limit),
+                models.Prefetch(query=self._sparse_vector(sparse[index]), using="sparse", filter=effective_filter, limit=limit),
+            ])
         result = self.client.query_points(
             collection_name=COLLECTION,
-            prefetch=[
-                models.Prefetch(query=dense[0].tolist(), using="dense", filter=effective_filter, limit=limit),
-                models.Prefetch(query=self._sparse_vector(sparse[0]), using="sparse", filter=effective_filter, limit=limit),
-            ],
+            prefetch=prefetches,
             query=models.FusionQuery(fusion=models.Fusion.RRF),
             limit=limit,
             with_payload=True,

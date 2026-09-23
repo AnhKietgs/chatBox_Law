@@ -46,6 +46,7 @@ function Chat() {
   const [selectedHistoryId, setSelectedHistoryId] = useState('')
   const [conversationId, setConversationId] = useState(() => localStorage.getItem(ACTIVE_CONVERSATION_KEY) || '')
   const [loading, setLoading] = useState(false)
+  const [clearingConversation, setClearingConversation] = useState(false)
   const [error, setError] = useState('')
   // Citations are already server-validated. Keep this filter in the UI as a
   // second guard so the user only sees sources that support a generated claim.
@@ -54,6 +55,7 @@ function Chat() {
   useEffect(() => { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)) }, [history])
   useEffect(() => { if (conversationId) localStorage.setItem(ACTIVE_CONVERSATION_KEY, conversationId); else localStorage.removeItem(ACTIVE_CONVERSATION_KEY) }, [conversationId])
   const submit = async () => {
+    if (clearingConversation) return
     setLoading(true); setError(''); setAnswer(null); setEndToEndMs(null)
     try {
       const result = await ask(question, asOfDate, conversationId)
@@ -74,34 +76,40 @@ function Chat() {
     setAnswer(entry.answer); setEndToEndMs(entry.endToEndMs); setSelectedHistoryId(entry.id); setConversationId(entry.conversationId || ''); setError('')
   }
   const deleteHistory = async (entry: HistoryEntry) => {
+    const removesActiveConversation = conversationId === entry.conversationId || selectedHistoryId === entry.id
+    if (removesActiveConversation) startNewChat()
+    setClearingConversation(true)
     try {
       if (entry.conversationId) await deleteConversation(entry.conversationId)
       setHistory(items => items.filter(item => entry.conversationId ? item.conversationId !== entry.conversationId : item.id !== entry.id))
-      if (conversationId === entry.conversationId || selectedHistoryId === entry.id) startNewChat()
     } catch (err) { setError(err instanceof Error ? err.message : 'Không thể xóa đoạn chat') }
+    finally { setClearingConversation(false) }
   }
   const startNewChat = () => {
     setQuestion(''); setAsOfDate(''); setAnswer(null); setEndToEndMs(null); setError(''); setSelectedHistoryId(''); setConversationId('')
   }
   const clearHistory = async () => {
+    startNewChat()
+    setClearingConversation(true)
     try {
       const ids = [...new Set(history.map(entry => entry.conversationId).filter((id): id is string => Boolean(id)))]
       await Promise.all(ids.map(deleteConversation))
-      setHistory([]); startNewChat()
+      setHistory([])
     } catch (err) { setError(err instanceof Error ? err.message : 'Không thể xóa lịch sử') }
+    finally { setClearingConversation(false) }
   }
   return <div className="chat-shell">
     <aside className="chat-history" aria-label="Lịch sử câu hỏi">
-      <div className="history-heading"><h2>Lịch sử hỏi đáp</h2><div className="history-actions"><button className="history-new" type="button" onClick={startNewChat}>Đoạn chat mới</button>{history.length > 0 && <button className="history-clear" type="button" onClick={() => void clearHistory()}>Xóa tất cả</button>}</div></div>
-      {history.length === 0 ? <p className="history-empty">Chưa có câu hỏi nào.</p> : <ul>{history.map(entry => <li key={entry.id} className={entry.id === selectedHistoryId ? 'selected' : ''}><button className="history-open" type="button" onClick={() => openHistory(entry)}><span>{entry.question}</span><small>{entry.answer.status === 'grounded' ? 'Có căn cứ' : 'Chưa đủ căn cứ'}</small></button><button className="history-delete" type="button" aria-label={`Xóa đoạn chat: ${entry.question}`} onClick={() => void deleteHistory(entry)}>×</button></li>)}</ul>}
+      <div className="history-heading"><h2>Lịch sử hỏi đáp</h2><div className="history-actions"><button className="history-new" type="button" disabled={clearingConversation} onClick={startNewChat}>Đoạn chat mới</button>{history.length > 0 && <button className="history-clear" type="button" disabled={clearingConversation} onClick={() => void clearHistory()}>Xóa tất cả</button>}</div></div>
+      {history.length === 0 ? <p className="history-empty">Chưa có câu hỏi nào.</p> : <ul>{history.map(entry => <li key={entry.id} className={entry.id === selectedHistoryId ? 'selected' : ''}><button className="history-open" type="button" disabled={clearingConversation} onClick={() => openHistory(entry)}><span>{entry.question}</span><small>{entry.answer.status === 'grounded' ? 'Có căn cứ' : 'Chưa đủ căn cứ'}</small></button><button className="history-delete" type="button" disabled={clearingConversation} aria-label={`Xóa đoạn chat: ${entry.question}`} onClick={() => void deleteHistory(entry)}>×</button></li>)}</ul>}
       <p className="history-note">Xóa một mục sẽ xóa ngữ cảnh đoạn chat đó.</p>
     </aside>
     <main className="chat-page">
     <nav><span className="brand">ChatBot Luật RAG</span><a href="#admin">Quản trị kho luật</a></nav>
     <form className="ask" onSubmit={event => { event.preventDefault(); void submit() }}>
-      <label>Câu hỏi pháp lý<textarea value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (!loading && question.trim().length >= 8) void submit() } }} minLength={8} required placeholder="Ví dụ: Mức phạt vi phạm hợp đồng mua bán hàng hóa tối đa là bao nhiêu?" /></label>
+      <label>Câu hỏi pháp lý<textarea value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (!loading && !clearingConversation && question.trim().length >= 8) void submit() } }} minLength={8} required placeholder="Ví dụ: Mức phạt vi phạm hợp đồng mua bán hàng hóa tối đa là bao nhiêu?" /></label>
       <small>Enter để hỏi · Shift + Enter để xuống dòng</small>
-      <button disabled={loading}>{loading ? 'Đang đối chiếu nguồn…' : 'Hỏi pháp luật'}</button>
+      <button disabled={loading || clearingConversation}>{loading ? 'Đang đối chiếu nguồn…' : clearingConversation ? 'Đang xóa đoạn chat…' : 'Hỏi pháp luật'}</button>
     </form>
     {error && <p className="error">{error}</p>}
     {answer && <section className={`answer ${answer.status}`}>

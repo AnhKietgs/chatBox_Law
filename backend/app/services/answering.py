@@ -110,6 +110,28 @@ def abstain(as_of: date) -> ChatResponse:
     return ChatResponse(status="abstained", answer=ABSTENTION, warnings=["Không suy đoán khi không có căn cứ Điều/Khoản/Điểm."], applied_as_of_date=as_of)
 
 
+def extractive_fallback(retrieved: list[RetrievedProvision], as_of: date) -> ChatResponse:
+    """Return a verified provision verbatim when a small LLM fails despite strong recall."""
+    if not retrieved or retrieved[0].score < get_settings().extractive_fallback_threshold:
+        return abstain(as_of)
+    item = retrieved[0]
+    citation = citation_from(item)
+    locator = f"Điều {citation.article}"
+    if citation.clause:
+        locator += f", Khoản {citation.clause}"
+    if citation.point:
+        locator += f", Điểm {citation.point}"
+    logger.info("Using citation-first fallback from %s (%s, score=%.3f)", citation.document_code, locator, item.score)
+    return ChatResponse(
+        status="grounded",
+        answer=f"Theo {citation.document_title}, {locator}: {item.provision.content}",
+        claims=[Claim(text=item.provision.content, citation_ids=[item.provision.id])],
+        citations=[citation],
+        warnings=["Câu trả lời được trích nguyên văn từ căn cứ pháp lý đã kiểm chứng.", "Thông tin có tính tham khảo, không thay thế tư vấn pháp lý cho tình huống cụ thể."],
+        applied_as_of_date=as_of,
+    )
+
+
 def claims_are_supported(answer: ChatResponse, retrieved: list[RetrievedProvision]) -> bool:
     """Require each LLM claim to be semantically supported by one cited excerpt."""
     source_by_id = {item.provision.id: item for item in retrieved}
@@ -157,6 +179,8 @@ class GroundedAnswerService:
             "trong answer, claim text hoặc bất kỳ nội dung hiển thị cho người dùng. "
             "Lịch sử hội thoại chỉ dùng để hiểu các từ tham chiếu như 'điều đó' hoặc 'trường hợp trên'; "
             "không phải căn cứ pháp lý và không được dùng để tạo kết luận nếu nguồn không hỗ trợ. "
+            "Nếu nguồn có quy định trực tiếp, phải trả lời ngắn gọn từ nguồn đó. Chỉ tạo từ một đến ba claims "
+            "trực tiếp trả lời câu hỏi; không thêm định nghĩa, ngoại lệ hoặc chế tài không cần thiết. "
             "Nếu nguồn được cung cấp không trực tiếp trả lời câu hỏi, hãy trả về JSON hợp lệ với "
             "abstain=true, answer='Không đủ căn cứ pháp lý từ các nguồn được cung cấp.', claims=[] và warnings=[]. "
             "Không viết Markdown, giải thích ngoài JSON hoặc phần suy luận."
@@ -198,14 +222,16 @@ class GroundedAnswerService:
                         body.get("done_reason"),
                         body.get("eval_count"),
                     )
-                    return AnswerGeneration(abstain(as_of), (perf_counter() - llm_started) * 1000, 0)
+                    return AnswerGeneration(extractive_fallback(retrieved, as_of), (perf_counter() - llm_started) * 1000, 0)
         except Exception as exc:
             logger.warning("Ollama generation failed; returning safe abstention: %s", exc)
-            return AnswerGeneration(abstain(as_of), (perf_counter() - llm_started) * 1000, 0)
+            return AnswerGeneration(extractive_fallback(retrieved, as_of), (perf_counter() - llm_started) * 1000, 0)
         llm_ms = (perf_counter() - llm_started) * 1000
         validation_started = perf_counter()
         answer = validate_model_answer(raw, retrieved, as_of, question)
-        if answer.status == "grounded" and not claims_are_supported(answer, retrieved):
+        if answer.status == "abstained":
+            answer = extractive_fallback(retrieved, as_of)
+        elif not claims_are_supported(answer, retrieved):
             logger.warning("Rejected LLM output: a claim is not supported by its cited excerpt")
-            answer = abstain(as_of)
+            answer = extractive_fallback(retrieved, as_of)
         return AnswerGeneration(answer, llm_ms, (perf_counter() - validation_started) * 1000)

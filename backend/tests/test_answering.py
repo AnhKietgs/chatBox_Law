@@ -4,7 +4,8 @@ from datetime import date
 from types import ModuleType, SimpleNamespace
 from uuid import uuid4
 from app.models import LegalDocument, LegalProvision, LegalVersion, VersionStatus
-from app.services.answering import claims_are_supported, validate_model_answer
+from app.services import answering
+from app.services.answering import claims_are_supported, extractive_fallback, validate_model_answer
 
 
 def candidate():
@@ -36,6 +37,15 @@ def test_question_echo_forces_abstention():
 def test_model_can_abstain_with_a_schema_valid_response():
     raw = json.dumps({"answer": "Không đủ căn cứ pháp lý từ các nguồn được cung cấp.", "claims": [], "warnings": [], "abstain": True})
     assert validate_model_answer(raw, [candidate()], date.today(), "Câu hỏi ngoài phạm vi").status == "abstained"
+
+
+def test_high_confidence_source_uses_extractive_fallback(monkeypatch):
+    item = candidate()
+    monkeypatch.setattr(answering, "get_settings", lambda: SimpleNamespace(extractive_fallback_threshold=0.85))
+    result = extractive_fallback([item], date.today())
+    assert result.status == "grounded"
+    assert result.citations[0].article == "301"
+    assert result.claims[0].citation_ids == [item.provision.id]
 
 
 def test_assistant_message_wrapper_is_unwrapped_before_validation():

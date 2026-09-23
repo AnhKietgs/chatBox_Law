@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from ..models import LegalProvision, LegalVersion, LegalDocument, VersionStatus
 from ..config import get_settings
 from ..versioning import is_effective
-from .query_expansion import expand_short_commercial_query
+from .query_expansion import expand_commercial_query
 from .conversation import contextual_retrieval_query
 from .vector_store import HybridVectorStore
 
@@ -35,9 +35,9 @@ class RetrievalResult:
 def log_top_k(stage: str, question: str, candidates: list[RetrievedProvision], score_label: str) -> None:
     """Development-only, human-readable retrieval trace for relevance debugging."""
     settings = get_settings()
-    if not settings.retrieval_debug_logs:
+    if not getattr(settings, "retrieval_debug_logs", False):
         return
-    top_k = max(1, settings.retrieval_debug_top_k)
+    top_k = max(1, getattr(settings, "retrieval_debug_top_k", 8))
     logger.info("Retrieval %s: query=%r, candidates=%d", stage, question[:500], len(candidates))
     for rank, item in enumerate(candidates[:top_k], start=1):
         excerpt = " ".join(item.provision.content.split())
@@ -68,10 +68,15 @@ class LegalRetriever:
     def retrieve_with_metrics(self, question: str, as_of: date, limit: int = 8, conversation_context: str = "") -> RetrievalResult:
         retrieval_started = perf_counter()
         retrieval_query = contextual_retrieval_query(question, conversation_context)
-        expanded = expand_short_commercial_query(retrieval_query)
+        expanded = expand_commercial_query(retrieval_query)
         if expanded.applied and get_settings().retrieval_debug_logs:
             logger.info("Retrieval query expansion: original=%r expanded=%r", expanded.original, expanded.retrieval_query)
-        points = HybridVectorStore().search(expanded.retrieval_query, as_of.isoformat(), limit=limit * 2)
+        points = HybridVectorStore().search(
+            retrieval_query,
+            as_of.isoformat(),
+            limit=limit * 2,
+            expansion_query=expanded.retrieval_query if expanded.applied else None,
+        )
         ids = [UUID(str(point.id)) for point in points]
         scores = {UUID(str(point.id)): float(point.score) for point in points}
         if not ids:
@@ -113,7 +118,9 @@ class Reranker:
             scores = [scores]
         threshold = get_settings().confidence_threshold
         ranked = sorted(zip(scores, candidates), key=lambda pair: pair[0], reverse=True)
-        return [replace(item, score=float(score)) for score, item in ranked if float(score) >= threshold]
+        scored = [replace(item, score=float(score)) for score, item in ranked]
+        log_top_k("reranker-raw", question, scored, "reranker_score")
+        return [item for item in scored if item.score >= threshold]
 
 
 @lru_cache(maxsize=1)
