@@ -8,18 +8,32 @@ const HISTORY_LIMIT = 20
 
 type HistoryEntry = {
   id: string
+  // The first question names a conversation; later questions update this same entry.
   question: string
+  lastQuestion: string
   asOfDate: string
   answer: Answer
   endToEndMs: number
   createdAt: string
+  updatedAt: string
+  turnCount: number
   conversationId?: string
 }
 
 function loadHistory(): HistoryEntry[] {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]')
-    return Array.isArray(value) ? value as HistoryEntry[] : []
+    if (!Array.isArray(value)) return []
+    // Upgrade the old per-question local history into one item per conversation.
+    const grouped = new Map<string, HistoryEntry>()
+    const ordered = (value as HistoryEntry[]).sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''))
+    for (const item of ordered) {
+      const key = item.conversationId || `legacy-${item.id}`
+      const normalized: HistoryEntry = { ...item, lastQuestion: item.lastQuestion || item.question, updatedAt: item.updatedAt || item.createdAt, turnCount: item.turnCount || 1 }
+      const existing = grouped.get(key)
+      grouped.set(key, existing ? { ...existing, lastQuestion: normalized.lastQuestion, asOfDate: normalized.asOfDate, answer: normalized.answer, endToEndMs: normalized.endToEndMs, updatedAt: normalized.updatedAt, turnCount: existing.turnCount + 1 } : normalized)
+    }
+    return [...grouped.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, HISTORY_LIMIT)
   } catch {
     return []
   }
@@ -63,12 +77,17 @@ function Chat() {
       setEndToEndMs(result.endToEndMs)
       const nextConversationId = result.answer.conversation_id || conversationId
       setConversationId(nextConversationId)
-      const entry: HistoryEntry = {
-        id: crypto.randomUUID(), question: question.trim(), asOfDate, answer: result.answer,
-        endToEndMs: result.endToEndMs, createdAt: new Date().toISOString(), conversationId: nextConversationId || undefined,
-      }
-      setHistory(items => [entry, ...items].slice(0, HISTORY_LIMIT))
-      setSelectedHistoryId(entry.id)
+      const now = new Date().toISOString()
+      const existingEntry = history.find(item => item.conversationId === nextConversationId)
+      const entryId = existingEntry?.id || crypto.randomUUID()
+      setHistory(items => {
+        const existing = items.find(item => item.conversationId === nextConversationId)
+        const entry: HistoryEntry = existing
+          ? { ...existing, lastQuestion: question.trim(), asOfDate, answer: result.answer, endToEndMs: result.endToEndMs, updatedAt: now, turnCount: existing.turnCount + 1 }
+          : { id: entryId, question: question.trim(), lastQuestion: question.trim(), asOfDate, answer: result.answer, endToEndMs: result.endToEndMs, createdAt: now, updatedAt: now, turnCount: 1, conversationId: nextConversationId || undefined }
+        return [entry, ...items.filter(item => item.id !== entry.id)].slice(0, HISTORY_LIMIT)
+      })
+      setSelectedHistoryId(entryId)
       setQuestion('')
     } catch (err) { setError(err instanceof Error ? err.message : 'Đã có lỗi xảy ra') } finally { setLoading(false) }
   }
@@ -101,7 +120,7 @@ function Chat() {
   return <div className="chat-shell">
     <aside className="chat-history" aria-label="Lịch sử câu hỏi">
       <div className="history-heading"><h2>Lịch sử hỏi đáp</h2><div className="history-actions"><button className="history-new" type="button" disabled={clearingConversation} onClick={startNewChat}>Đoạn chat mới</button>{history.length > 0 && <button className="history-clear" type="button" disabled={clearingConversation} onClick={() => void clearHistory()}>Xóa tất cả</button>}</div></div>
-      {history.length === 0 ? <p className="history-empty">Chưa có câu hỏi nào.</p> : <ul>{history.map(entry => <li key={entry.id} className={entry.id === selectedHistoryId ? 'selected' : ''}><button className="history-open" type="button" disabled={clearingConversation} onClick={() => openHistory(entry)}><span>{entry.question}</span><small>{entry.answer.status === 'grounded' ? 'Có căn cứ' : 'Chưa đủ căn cứ'}</small></button><button className="history-delete" type="button" disabled={clearingConversation} aria-label={`Xóa đoạn chat: ${entry.question}`} onClick={() => void deleteHistory(entry)}>×</button></li>)}</ul>}
+      {history.length === 0 ? <p className="history-empty">Chưa có đoạn chat nào.</p> : <ul>{history.map(entry => <li key={entry.id} className={entry.id === selectedHistoryId ? 'selected' : ''}><button className="history-open" type="button" disabled={clearingConversation} onClick={() => openHistory(entry)}><span>{entry.question}</span><small>{entry.answer.status === 'grounded' ? 'Có căn cứ' : 'Chưa đủ căn cứ'} · {entry.turnCount} lượt hỏi</small></button><button className="history-delete" type="button" disabled={clearingConversation} aria-label={`Xóa đoạn chat: ${entry.question}`} onClick={() => void deleteHistory(entry)}>×</button></li>)}</ul>}
       <p className="history-note">Xóa một mục sẽ xóa ngữ cảnh đoạn chat đó.</p>
     </aside>
     <main className="chat-page">
