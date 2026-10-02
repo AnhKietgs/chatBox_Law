@@ -152,7 +152,7 @@ def test_new_settings_have_correct_defaults():
     assert s.context_reserved_output == 1024
     assert s.context_overhead == 256
     assert s.retrieval_recall_pool == 30
-    assert s.retrieval_inject_limit == 5
+    assert s.retrieval_inject_limit == 7
     assert s.map_reduce_enabled is False
     assert s.map_batch_token_limit == 2000
     assert s.map_reduce_timeout_seconds == 60.0

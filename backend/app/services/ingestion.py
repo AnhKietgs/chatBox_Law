@@ -87,6 +87,75 @@ def process_version(db: Session, job_id: UUID, filename: str) -> None:
         raise
 
 
+def _build_embedding_records(version: LegalVersion) -> list[tuple[UUID, str, dict]]:
+    """Xây dựng danh sách (provision_id, text, payload) để upsert vào Qdrant.
+
+    Text của mỗi khoản/điểm được làm giàu với heading cấp Điều, giúp
+    reranker hiểu ngữ cảnh cho các khoản ngắn đứng một mình.
+    Ví dụ: Điều 131 K4 "Bên có lỗi gây thiệt hại thì phải bồi thường."
+    được embed thành:
+      "Điều 131. Hậu quả pháp lý của giao dịch dân sự vô hiệu
+       Khoản 4: Bên có lỗi gây thiệt hại thì phải bồi thường."
+    Dùng chung cho publish_version() và reindex_version().
+    """
+    # Bước 1: Lập bảng heading cấp Điều (provision không có clause_no và point_label)
+    article_headings: dict[str, str] = {}
+    for p in version.provisions:
+        if p.clause_no is None and p.point_label is None and p.heading:
+            article_headings[p.article_no] = p.heading
+
+    payload_base = {
+        "version_id": str(version.id),
+        "status": "PUBLISHED",
+        "effective_from": version.effective_from.isoformat(),
+        "effective_to": version.effective_to.isoformat() if version.effective_to else None,
+    }
+
+    records: list[tuple[UUID, str, dict]] = []
+    for provision in version.provisions:
+        if provision.clause_no is not None:
+            # Khoản hoặc điểm: tiền tố với heading Điều để reranker có ngữ cảnh
+            article_heading = article_headings.get(provision.article_no, "")
+            clause_part = f"Khoản {provision.clause_no}"
+            if provision.point_label:
+                clause_part += f", Điểm {provision.point_label}"
+            text = (
+                f"Điều {provision.article_no}. {article_heading}\n"
+                f"{clause_part}: {provision.content}"
+            )
+        else:
+            # Provision cấp Điều: dùng heading của chính nó
+            effective_heading = provision.heading or article_headings.get(provision.article_no, "")
+            text = f"Điều {provision.article_no}. {effective_heading}\n{provision.content}"
+        records.append((provision.id, text, payload_base))
+    return records
+
+
+def _upsert_records(
+    records: list[tuple[UUID, str, dict]],
+    label: str,
+) -> None:
+    """Chia batch và upsert vào Qdrant. label dùng cho log."""
+    vector_store = HybridVectorStore()
+    batch_size = get_settings().index_batch_size
+    total = len(records)
+    for start in range(0, total, batch_size):
+        vector_store.upsert_many(records[start:start + batch_size])
+        logger.info("%s: upserted %d/%d provisions", label, min(start + batch_size, total), total)
+
+
+def reindex_version(db: Session, version: LegalVersion) -> int:
+    """Re-embed và upsert lại Qdrant cho version PUBLISHED mà không đổi trạng thái.
+
+    Dùng khi logic tạo embedding text thay đổi nhưng cấu trúc provisions
+    trong PostgreSQL vẫn đúng — không cần re-upload PDF.
+    """
+    records = _build_embedding_records(version)
+    _upsert_records(records, f"Reindex version {version.id}")
+    db.commit()
+    return len(records)
+
+
 def publish_version(db: Session, version: LegalVersion) -> int:
     if version.status != VersionStatus.pending_review:
         raise ValueError("Chỉ phiên bản đã xử lý và chờ duyệt mới có thể xuất bản")
@@ -100,20 +169,10 @@ def publish_version(db: Session, version: LegalVersion) -> int:
             previous.effective_to = version.effective_from - timedelta(days=1)
         elif previous.effective_from >= version.effective_from:
             raise ValueError("Phiên bản mới có khoảng hiệu lực chồng lấn với phiên bản đã xuất bản")
-    vector_store = HybridVectorStore()
-    records: list[tuple[UUID, str, dict]] = []
+    records = _build_embedding_records(version)
     for provision in version.provisions:
-        text = f"Điều {provision.article_no}. {provision.heading or ''}\n{provision.content}"
-        records.append((provision.id, text, {
-            "version_id": str(version.id), "status": "PUBLISHED", "effective_from": version.effective_from.isoformat(),
-            "effective_to": version.effective_to.isoformat() if version.effective_to else None,
-        }))
         provision.vector_id = str(provision.id)
-    batch_size = get_settings().index_batch_size
-    total = len(records)
-    for start in range(0, total, batch_size):
-        vector_store.upsert_many(records[start:start + batch_size])
-        logger.info("Publishing version %s: indexed %d/%d provisions", version.id, min(start + batch_size, total), total)
+    _upsert_records(records, f"Publishing version {version.id}")
     version.status = VersionStatus.published
     db.commit()
-    return total
+    return len(records)

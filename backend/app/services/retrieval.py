@@ -173,15 +173,34 @@ class LegalRetriever:
         # Áp dụng domain filter sau rerank: loại bỏ provisions không cùng
         # văn bản dominant. Nếu sau lọc không còn gì → answering.py abstain
         # qua reranker_minimum_absolute_score gate hoặc empty-list gate.
+        if dominant_doc_code and provisions:
+            # Exception: nếu reranker top-1 là từ domain KHÁC với dominant
+            # và score cao hơn đáng kể (≥1.5x) → user đang topic-switch sang
+            # chủ thể pháp lý mới (VD: "hợp đồng ủy quyền" sau "hợp đồng đại lý")
+            # → bỏ qua domain filter để không chặn domain mới.
+            top_prov = provisions[0]
+            if top_prov.document.code != dominant_doc_code:
+                dominant_top_score = max(
+                    (p.score for p in provisions if p.document.code == dominant_doc_code),
+                    default=0.0,
+                )
+                if top_prov.score >= dominant_top_score * 1.5:
+                    logger.info(
+                        "Domain coherence filter: skipped — cross-domain top-1 %s (score=%.3f) outranks dominant %s (%.3f)",
+                        top_prov.document.code, top_prov.score,
+                        dominant_doc_code, dominant_top_score,
+                    )
+                    dominant_doc_code = None  # skip filter below
+
         if dominant_doc_code:
             same_domain = [p for p in provisions if p.document.code == dominant_doc_code]
             if same_domain:
-                provisions = same_domain
                 logger.info(
                     "Domain coherence filter: kept %d %s provisions, dropped %d cross-domain",
                     len(same_domain), dominant_doc_code,
-                    len([p for p in provisions if p.document.code != dominant_doc_code]),
+                    len(provisions) - len(same_domain),
                 )
+                provisions = same_domain
             else:
                 # Không có cùng domain sau rerank → trả empty để abstain
                 logger.info("Domain coherence filter: no %s provision survived rerank → will abstain", dominant_doc_code)

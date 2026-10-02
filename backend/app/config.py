@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     context_overhead: int = 256           # JSON wrappers, system markers
     # Retrieval pool vs. injection limit
     retrieval_recall_pool: int = 30       # candidates retrieved for reranking
-    retrieval_inject_limit: int = 5       # top provisions injected into prompt
+    retrieval_inject_limit: int = 7       # top provisions injected into prompt
     # Map-Reduce (default OFF; enable via MAP_REDUCE_ENABLED=true in .env)
     map_reduce_enabled: bool = False
     map_batch_token_limit: int = 2000     # max tokens per map batch

@@ -1,5 +1,6 @@
 from datetime import date
 import logging
+import re
 from time import perf_counter
 from uuid import UUID
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -101,12 +102,51 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         hyde_query=augmentation.hypothetical_document,
     )
     logger.info("Chat retrieval returned %d grounded provisions for %s", len(retrieval.provisions), applied_date.isoformat())
+
+    # ------------------------------------------------------------------ #
+    # Ambiguous standalone query gate                                      #
+    # Câu hỏi cực ngắn + không có context + retrieval trả về nhiều văn   #
+    # bản khác nhau (mixed domain) → câu hỏi mơ hồ, nên hỏi lại thay vì #
+    # đoán domain. Điều kiện:                                             #
+    #   1. Không có conversation context (standalone)                     #
+    #   2. ≤ 6 từ trong câu hỏi gốc                                      #
+    #   3. Không có số điều cụ thể / mã luật trong câu hỏi               #
+    #   4. Retrieval trả về ≥ 2 văn bản khác nhau (mixed domain)         #
+    # ------------------------------------------------------------------ #
+    _HAS_SPECIFIC_REF = re.compile(
+        r"\b(điều\s+\d+|khoản\s+\d+|ltm|blds|blhs|bllđ|blds|luật\s+\w+)\b",
+        re.IGNORECASE | re.UNICODE,
+    )
+    if (
+        not conversation_context
+        and len(re.findall(r"\w+", payload.question)) <= 6
+        and not _HAS_SPECIFIC_REF.search(payload.question)
+        and retrieval.provisions
+        and len({p.document.code for p in retrieval.provisions}) > 1
+    ):
+        logger.info(
+            "Chat ambiguous standalone query (short=%d words, mixed domains=%s) → clarification",
+            len(re.findall(r"\w+", payload.question)),
+            {p.document.code for p in retrieval.provisions},
+        )
+        answer = abstain(applied_date)
+        answer.answer = (
+            "Câu hỏi chưa xác định rõ lĩnh vực pháp lý. "
+            "Vui lòng cho biết thêm bối cảnh — ví dụ: loại hợp đồng, đối tượng áp dụng, "
+            "hoặc tên luật bạn muốn tra cứu."
+        )
+        answer.warnings = ["Không suy đoán domain khi câu hỏi ngắn có thể áp dụng nhiều văn bản khác nhau."]
+        answer.conversation_id = save_turn(db, conversation, payload.question, answer.answer)
+        answer.latency = LatencyBreakdown(total_ms=round((perf_counter() - started) * 1000, 1))
+        return answer
+
     generation = await GroundedAnswerService().generate(
         payload.question,
         retrieval.provisions,
         applied_date,
         conversation_context,
         fallback_minimum_score=retrieval.minimum_score,
+        retrieval_query=contextualized.retrieval_query,
     )
     generation.answer.conversation_id = save_turn(db, conversation, payload.question, generation.answer.answer)
 

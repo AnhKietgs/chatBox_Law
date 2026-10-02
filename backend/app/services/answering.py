@@ -164,7 +164,7 @@ def claims_are_supported(answer: ChatResponse, retrieved: list[RetrievedProvisio
 
 
 class GroundedAnswerService:
-    async def generate(self, question: str, retrieved: list[RetrievedProvision], as_of: date, conversation_context: str = "", fallback_minimum_score: float | None = None) -> AnswerGeneration:
+    async def generate(self, question: str, retrieved: list[RetrievedProvision], as_of: date, conversation_context: str = "", fallback_minimum_score: float | None = None, retrieval_query: str | None = None) -> AnswerGeneration:
         if not retrieved:
             logger.info("Abstaining because retrieval returned no eligible provision")
             return AnswerGeneration(abstain(as_of), 0, 0)
@@ -198,8 +198,19 @@ class GroundedAnswerService:
             "trong answer, claim text hoặc bất kỳ nội dung hiển thị cho người dùng. "
             "Lịch sử hội thoại chỉ dùng để hiểu các từ tham chiếu như 'điều đó' hoặc 'trường hợp trên'; "
             "không phải căn cứ pháp lý và không được dùng để tạo kết luận nếu nguồn không hỗ trợ. "
+            "QUAN TRỌNG — Quy tắc trả lời vs abstain:\n"
+            "- NÊN trả lời khi: nguồn chứa đúng điều/khoản được hỏi, hoặc nội dung nguồn trực tiếp mô tả "
+            "khái niệm/quy định mà câu hỏi đề cập. Trả lời bằng cách tóm tắt hoặc trích nội dung nguồn.\n"
+            "- PHẢI abstain=true khi: không có nguồn nào đề cập đến chủ thể câu hỏi, HOẶC câu hỏi hỏi "
+            "về HẬU QUẢ/XỬ LÝ mà không có nguồn nào quy định hậu quả đó. "
+            "Ví dụ cụ thể cần abstain: 'hậu quả khi vượt quá X' mà không có nguồn nào nói hậu quả; "
+            "'điều gì xảy ra khi vi phạm Y' mà chỉ có nguồn định nghĩa Y. "
+            "Không suy luận hậu quả từ định nghĩa. "
             "Nếu nguồn có quy định trực tiếp, phải trả lời ngắn gọn từ nguồn đó. Chỉ tạo từ một đến ba claims "
             "trực tiếp trả lời câu hỏi; không thêm định nghĩa, ngoại lệ hoặc chế tài không cần thiết. "
+            "TUYỆT ĐỐI không lặp lại câu hỏi trong trường answer — answer phải bắt đầu ngay bằng nội dung trả lời. "
+            "Khi nguồn có nhiều nhánh điều kiện phức tạp (VD: 'nếu A thì X; nếu B thì Y'), "
+            "phải trích dẫn CHÍNH XÁC từng điều kiện và hậu quả tương ứng, không được hoán đổi hoặc nhầm lẫn giữa các nhánh. "
             "Nếu nguồn được cung cấp không trực tiếp trả lời câu hỏi, hãy trả về JSON hợp lệ với "
             "abstain=true, answer='Không đủ căn cứ pháp lý từ các nguồn được cung cấp.', claims=[] và warnings=[]. "
             "Không viết Markdown, giải thích ngoài JSON hoặc phần suy luận."
@@ -210,6 +221,13 @@ class GroundedAnswerService:
         # ------------------------------------------------------------------ #
         from .token_budget import TokenBudget
         from .map_reduce import MapReduceSummarizer
+
+        # LLM luôn nhận câu hỏi gốc của user — không dùng retrieval_query vì:
+        # 1) retrieval_query được tối ưu cho vector search, không phải cho LLM
+        # 2) Nếu dùng retrieval_query, LLM có xu hướng echo lại câu dài đó
+        # 3) retrieval_query "bị xử lý như thế nào" có thể kéo sources sai (Điều 321)
+        # LLM đã có conversation_context để hiểu ngữ cảnh đầy đủ.
+        effective_question = question
 
         budget_started = perf_counter()
         tb = TokenBudget(
@@ -222,7 +240,7 @@ class GroundedAnswerService:
             system_prompt
             + f"\nNgày áp dụng: {as_of.isoformat()}."
             + f"\nLịch sử hội thoại: {conversation_context or '(không có)'}"
-            + f"\nCâu hỏi hiện tại: {question}"
+            + f"\nCâu hỏi hiện tại: {effective_question}"
         )
         sources_fitted, was_truncated = tb.fit_sources_to_budget(sources, fixed_text)
         token_budget_ms = (perf_counter() - budget_started) * 1000
@@ -262,7 +280,7 @@ class GroundedAnswerService:
         user_prompt = (
             f"Ngày áp dụng: {as_of.isoformat()}. "
             f"Lịch sử hội thoại (không phải căn cứ pháp lý): {conversation_context or '(không có)'}\n"
-            f"Câu hỏi hiện tại: {question}\n"
+            f"Câu hỏi hiện tại: {effective_question}\n"
             f"Nguồn: {json.dumps(sources_fitted, ensure_ascii=False)}"
         )
 
@@ -317,10 +335,11 @@ class GroundedAnswerService:
         validation_started = perf_counter()
         answer = validate_model_answer(raw, retrieved, as_of, question)
         if answer.status == "abstained":
-            # Dùng extractive_fallback_threshold từ config (0.50) thay vì
-            # retrieval.minimum_score (percentile reranker ~0.003) — tránh
-            # trả ra source không liên quan khi LLM đã abstain.
-            answer = extractive_fallback(retrieved, as_of, minimum_score=None)
+            # LLM đã đánh giá nguồn không đủ để trả lời → trả abstain thật,
+            # không dùng extractive_fallback vì source top-1 có thể không
+            # liên quan đến câu hỏi hiện tại (chỉ liên quan đến context).
+            logger.info("LLM abstained — returning hard abstain (no extractive fallback)")
+            answer = abstain(as_of)
         elif not claims_are_supported(answer, retrieved):
             logger.warning("Rejected LLM output: a claim is not supported by its cited excerpt")
             answer = extractive_fallback(retrieved, as_of, fallback_minimum_score)

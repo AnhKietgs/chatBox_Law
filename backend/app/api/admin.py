@@ -12,7 +12,7 @@ from ..database import get_db
 from ..models import IngestionJob, JobStatus, LegalDocument, LegalProvision, LegalVersion, VersionStatus
 from ..schemas import JobSummary, ProvisionSummary, PublishRequest, ReviewSummary, TokenRequest, TokenResponse, VersionSummary
 from ..security import issue_token, require_admin
-from ..services.ingestion import publish_version
+from ..services.ingestion import publish_version, reindex_version
 from ..services.storage import ObjectStorage
 from ..services.vector_store import HybridVectorStore
 from ..versioning import windows_overlap
@@ -159,6 +159,25 @@ def publish(version_id: UUID, payload: PublishRequest, _: str = Depends(require_
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"version_id": str(version.id), "indexed_provisions": count, "status": version.status.value}
+
+
+@router.post("/versions/{version_id}/reindex")
+def reindex(version_id: UUID, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """Re-embed và upsert lại Qdrant cho version đã publish, không cần re-upload PDF.
+
+    Dùng khi text embedding thay đổi (ví dụ: thêm heading Điều vào khoản con)
+    nhưng cấu trúc Điều/Khoản/Điểm trong PostgreSQL vẫn đúng.
+    """
+    version = db.get(LegalVersion, version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="Không tìm thấy phiên bản")
+    if version.status != VersionStatus.published:
+        raise HTTPException(status_code=422, detail="Chỉ có thể reindex phiên bản đang xuất bản")
+    try:
+        count = reindex_version(db, version)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Reindex thất bại: {exc}") from exc
+    return {"version_id": str(version.id), "reindexed_provisions": count, "status": version.status.value}
 
 
 @router.post("/versions/{version_id}/withdraw")
