@@ -168,8 +168,20 @@ class GroundedAnswerService:
         if not retrieved:
             logger.info("Abstaining because retrieval returned no eligible provision")
             return AnswerGeneration(abstain(as_of), 0, 0)
-        logger.info("Generating grounded answer with Ollama chat JSON schema v2 (%d sources)", len(retrieved))
         settings = get_settings()
+
+        # ── Absolute reranker score gate ──────────────────────────────────
+        # Nếu top result score < minimum → không có source nào đủ liên quan,
+        # abstain ngay. Tránh LLM thấy source "gần đúng" rồi sinh answer sai.
+        top_score = retrieved[0].score
+        if top_score < settings.reranker_minimum_absolute_score:
+            logger.info(
+                "Abstaining: top reranker score %.4f < minimum %.4f — no relevant source found",
+                top_score, settings.reranker_minimum_absolute_score,
+            )
+            return AnswerGeneration(abstain(as_of), 0, 0)
+
+        logger.info("Generating grounded answer with Ollama chat JSON schema v2 (%d sources)", len(retrieved))
 
         # Build the source list (without score — that key is internal only).
         sources = [{

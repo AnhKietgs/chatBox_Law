@@ -136,6 +136,27 @@ class LegalRetriever:
             if is_short_follow_up
             else settings.rerank_score_percentile
         )
+        # ── Domain coherence filter (chỉ áp dụng cho short follow-up) ────────
+        # Khi follow-up ngắn có đại từ ("mức đó", "điều này"...), reranker
+        # hay bị literal match sang văn bản sai domain (VD: "vượt quá" →
+        # BLDS Điều 143 thay vì LTM Điều 301).
+        # Tín hiệu đáng tin cậy hơn là hybrid recall: nếu top-K recall đa số
+        # từ một văn bản (≥ 60%), giữ lại provisions cùng văn bản đó sau rerank.
+        dominant_doc_code: str | None = None
+        if is_short_follow_up and valid:
+            from collections import Counter
+            top_recall = valid[:10]
+            doc_counts = Counter(p.document.code for p in top_recall)
+            top_code, top_count = doc_counts.most_common(1)[0]
+            if top_count >= len(top_recall) * 0.6:
+                dominant_doc_code = top_code
+                logger.info(
+                    "Domain coherence: dominant=%s (%d/%d recall hits) — will filter cross-domain after rerank",
+                    dominant_doc_code, top_count, len(top_recall),
+                )
+
+        # Reranker dùng retrieval_query (contextualized) để score chính xác
+        # hơn về domain; domain coherence filter ở trên lo phần lọc sai văn bản.
         provisions, minimum_score = Reranker().rerank_with_threshold(
             retrieval_query,
             valid,
@@ -148,6 +169,24 @@ class LegalRetriever:
             "contextual-follow-up" if is_short_follow_up else "standalone",
             len(valid),
         )
+
+        # Áp dụng domain filter sau rerank: loại bỏ provisions không cùng
+        # văn bản dominant. Nếu sau lọc không còn gì → answering.py abstain
+        # qua reranker_minimum_absolute_score gate hoặc empty-list gate.
+        if dominant_doc_code:
+            same_domain = [p for p in provisions if p.document.code == dominant_doc_code]
+            if same_domain:
+                provisions = same_domain
+                logger.info(
+                    "Domain coherence filter: kept %d %s provisions, dropped %d cross-domain",
+                    len(same_domain), dominant_doc_code,
+                    len([p for p in provisions if p.document.code != dominant_doc_code]),
+                )
+            else:
+                # Không có cùng domain sau rerank → trả empty để abstain
+                logger.info("Domain coherence filter: no %s provision survived rerank → will abstain", dominant_doc_code)
+                provisions = []
+
         provisions = provisions[:effective_inject_limit]
         log_top_k("reranked", question, provisions, "reranker_score")
         return RetrievalResult(provisions, retrieval_ms, (perf_counter() - rerank_started) * 1000, minimum_score)

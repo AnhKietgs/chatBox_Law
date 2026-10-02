@@ -25,8 +25,11 @@ class Settings(BaseSettings):
     conversation_confidence_threshold: float = 0.30
     # Dynamic reranker selection: retain candidates at or above this percentile
     # within the current recall batch. 70 = the top roughly 30% of that batch.
-    rerank_score_percentile: float = Field(default=70, ge=0, le=100)
-    conversation_rerank_score_percentile: float = Field(default=60, ge=0, le=100)
+    rerank_score_percentile: float = Field(default=75, ge=0, le=100)
+    conversation_rerank_score_percentile: float = Field(default=75, ge=0, le=100)
+    # Absolute floor: nếu top reranker score < giá trị này → abstain ngay,
+    # không để LLM thấy source không liên quan rồi sinh câu trả lời sai.
+    reranker_minimum_absolute_score: float = 0.05
     claim_support_threshold: float = 0.65
     extractive_fallback_threshold: float = 0.50
     index_batch_size: int = 32
@@ -48,7 +51,7 @@ class Settings(BaseSettings):
     context_reserved_output: int = 1024   # tokens set aside for generated answer
     context_overhead: int = 256           # JSON wrappers, system markers
     # Retrieval pool vs. injection limit
-    retrieval_recall_pool: int = 20       # candidates retrieved for reranking
+    retrieval_recall_pool: int = 30       # candidates retrieved for reranking
     retrieval_inject_limit: int = 5       # top provisions injected into prompt
     # Map-Reduce (default OFF; enable via MAP_REDUCE_ENABLED=true in .env)
     map_reduce_enabled: bool = False
