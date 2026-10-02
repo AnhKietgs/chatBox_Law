@@ -221,8 +221,19 @@ class Reranker:
     ) -> tuple[list[RetrievedProvision], float]:
         if not candidates:
             return [], minimum_score if minimum_score is not None else get_settings().confidence_threshold
+        # Xây bảng heading cấp Điều từ chính candidates (cấp Điều = clause_no là None).
+        # Dùng để inject ngữ cảnh cho khoản/điểm con ngắn, tránh dilute BM25 ở tầng
+        # embedding. VD: Điều 131 K4 "Bên có lỗi..." sẽ được reranker đọc kèm heading
+        # "Hậu quả pháp lý của giao dịch dân sự vô hiệu" → score đúng chỗ.
+        article_headings: dict[str, str] = {
+            item.provision.article_no: item.provision.heading
+            for item in candidates
+            if item.provision.clause_no is None and item.provision.heading
+        }
         passages = [
-            f"Điều {item.provision.article_no}. {item.provision.heading or ''}\n{item.provision.content}"
+            f"Điều {item.provision.article_no}. "
+            f"{article_headings.get(item.provision.article_no, item.provision.heading or '')}\n"
+            f"{item.provision.content}"
             for item in candidates
         ]
         # FlagEmbedding returns raw logits by default. Normalizing makes the
