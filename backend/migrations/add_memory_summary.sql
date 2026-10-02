@@ -1,0 +1,11 @@
+-- Migration: add memory_summary column to conversations table
+-- Date: 2026-10-01
+-- Safe: column is nullable, no data loss for existing rows.
+--
+-- For PostgreSQL (production):
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS memory_summary TEXT;
+--
+-- For SQLite (development / lawrag.db):
+-- SQLite does not support IF NOT EXISTS on ADD COLUMN before version 3.37.
+-- Run this instead if using SQLite < 3.37:
+--   ALTER TABLE conversations ADD COLUMN memory_summary TEXT;

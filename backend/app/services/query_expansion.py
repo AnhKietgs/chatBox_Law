@@ -33,7 +33,18 @@ def expand_commercial_query(question: str) -> ExpandedQuery:
         additions.append("mức phạt và chế tài vi phạm nghĩa vụ hợp đồng")
         if "tối đa" in normalized or "bao nhiêu" in normalized:
             additions.append("giới hạn mức phạt theo tỷ lệ phần trăm")
-    if "hợp đồng" in normalized:
+    # Chỉ expand sang thương mại khi có dấu hiệu rõ ràng — tránh drift
+    # sang LTM-2005 khi câu hỏi là về hợp đồng lao động, dân sự, v.v.
+    _labor_signals = {"lao động", "thử việc", "nhân viên", "người lao động",
+                      "sa thải", "thôi việc", "lương", "tiền lương", "bảo hiểm xã hội"}
+    _civil_signals  = {"dân sự", "thừa kế", "ly hôn", "hôn nhân", "tài sản",
+                       "bồi thường thiệt hại ngoài hợp đồng"}
+    _is_labor = any(s in normalized for s in _labor_signals)
+    _is_civil = any(s in normalized for s in _civil_signals)
+    _has_commercial = any(s in normalized for s in
+                          {"mua bán", "hàng hóa", "thương mại", "dịch vụ thương mại",
+                           "đại lý", "nhượng quyền", "logistics"})
+    if "hợp đồng" in normalized and _has_commercial and not _is_labor and not _is_civil:
         additions.append("hợp đồng thương mại mua bán hàng hóa")
     if "mua bán" in normalized or "hàng hóa" in normalized:
         additions.append("mua bán hàng hóa trong hoạt động thương mại")

@@ -18,6 +18,20 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+def score_percentile(scores: list[float], percentile: float) -> float:
+    """Return a NumPy-compatible linear percentile without a new dependency."""
+    if not scores:
+        raise ValueError("Cannot calculate a percentile from an empty score list")
+    if not 0 <= percentile <= 100:
+        raise ValueError("percentile must be between 0 and 100")
+    ordered = sorted(float(score) for score in scores)
+    position = (len(ordered) - 1) * percentile / 100
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
 @dataclass(frozen=True)
 class RetrievedProvision:
     provision: LegalProvision
@@ -64,25 +78,40 @@ class LegalRetriever:
     def __init__(self, db: Session):
         self.db = db
 
-    def retrieve(self, question: str, as_of: date, limit: int = 8, conversation_context: str = "") -> list[RetrievedProvision]:
-        return self.retrieve_with_metrics(question, as_of, limit, conversation_context).provisions
+    def retrieve(self, question: str, as_of: date, limit: int = 8, conversation_context: str = "", standalone_query: str | None = None, additional_queries: list[str] | None = None, hyde_query: str | None = None) -> list[RetrievedProvision]:
+        return self.retrieve_with_metrics(
+            question, as_of,
+            conversation_context=conversation_context,
+            standalone_query=standalone_query,
+            additional_queries=additional_queries,
+            hyde_query=hyde_query,
+        ).provisions
 
-    def retrieve_with_metrics(self, question: str, as_of: date, limit: int = 8, conversation_context: str = "") -> RetrievalResult:
+    def retrieve_with_metrics(self, question: str, as_of: date, limit: int = 8, inject_limit: int | None = None, conversation_context: str = "", standalone_query: str | None = None, additional_queries: list[str] | None = None, hyde_query: str | None = None) -> RetrievalResult:
+        settings = get_settings()
+        # inject_limit controls how many provisions reach the prompt;
+        # recall_pool controls how many candidates the vector store fetches for reranking.
+        effective_inject_limit = inject_limit if inject_limit is not None else settings.retrieval_inject_limit
+        recall_pool = settings.retrieval_recall_pool
         retrieval_started = perf_counter()
-        retrieval_query = contextual_retrieval_query(question, conversation_context)
+        # `standalone_query` comes from the contextualizer. Keep the old
+        # bounded-history composition only as a resilient compatibility fallback.
+        retrieval_query = standalone_query or contextual_retrieval_query(question, conversation_context)
         expanded = expand_commercial_query(retrieval_query)
-        if expanded.applied and get_settings().retrieval_debug_logs:
+        if expanded.applied and settings.retrieval_debug_logs:
             logger.info("Retrieval query expansion: original=%r expanded=%r", expanded.original, expanded.retrieval_query)
         points = HybridVectorStore().search(
             retrieval_query,
             as_of.isoformat(),
-            limit=limit * 2,
+            limit=recall_pool,
             expansion_query=expanded.retrieval_query if expanded.applied else None,
+            additional_queries=additional_queries,
+            hyde_query=hyde_query,
         )
         ids = [UUID(str(point.id)) for point in points]
         scores = {UUID(str(point.id)): float(point.score) for point in points}
         if not ids:
-            return RetrievalResult([], (perf_counter() - retrieval_started) * 1000, 0, get_settings().confidence_threshold)
+            return RetrievalResult([], (perf_counter() - retrieval_started) * 1000, 0, settings.confidence_threshold)
         rows = self.db.execute(
             select(LegalProvision, LegalVersion, LegalDocument)
             .join(LegalVersion, LegalProvision.version_id == LegalVersion.id)
@@ -98,30 +127,42 @@ class LegalRetriever:
         retrieval_ms = (perf_counter() - retrieval_started) * 1000
         # bge-reranker-v2-m3 is deliberately applied after hybrid recall.
         rerank_started = perf_counter()
-        # Short follow-ups such as “nếu vi phạm thì sao?” have little lexical
-        # overlap with a provision on their own. Their bounded conversation
-        # context resolves the reference, so use a separately calibrated
-        # threshold without weakening standalone legal queries.
+        # Short follow-ups have less direct lexical overlap. Keep a slightly
+        # broader percentile band after contextualization, while still selecting
+        # relative to the scores returned for this particular query.
         is_short_follow_up = bool(conversation_context) and len(re.findall(r"\w+", question)) <= 7
-        minimum_score = (
-            get_settings().conversation_confidence_threshold
+        score_percentile_value = (
+            settings.conversation_rerank_score_percentile
             if is_short_follow_up
-            else get_settings().confidence_threshold
+            else settings.rerank_score_percentile
+        )
+        provisions, minimum_score = Reranker().rerank_with_threshold(
+            retrieval_query,
+            valid,
+            percentile=score_percentile_value,
         )
         logger.info(
-            "Retrieval reranker threshold=%.2f mode=%s",
+            "Retrieval reranker percentile=%.1f threshold=%.4f mode=%s candidates=%d",
+            score_percentile_value,
             minimum_score,
             "contextual-follow-up" if is_short_follow_up else "standalone",
+            len(valid),
         )
-        provisions = Reranker().rerank(retrieval_query, valid, minimum_score=minimum_score)[:limit]
+        provisions = provisions[:effective_inject_limit]
         log_top_k("reranked", question, provisions, "reranker_score")
         return RetrievalResult(provisions, retrieval_ms, (perf_counter() - rerank_started) * 1000, minimum_score)
 
 
 class Reranker:
-    def rerank(self, question: str, candidates: list[RetrievedProvision], minimum_score: float | None = None) -> list[RetrievedProvision]:
+    def rerank_with_threshold(
+        self,
+        question: str,
+        candidates: list[RetrievedProvision],
+        minimum_score: float | None = None,
+        percentile: float | None = None,
+    ) -> tuple[list[RetrievedProvision], float]:
         if not candidates:
-            return []
+            return [], minimum_score if minimum_score is not None else get_settings().confidence_threshold
         passages = [
             f"Điều {item.provision.article_no}. {item.provision.heading or ''}\n{item.provision.content}"
             for item in candidates
@@ -133,11 +174,16 @@ class Reranker:
         )
         if isinstance(scores, float):
             scores = [scores]
-        threshold = minimum_score if minimum_score is not None else get_settings().confidence_threshold
+        numeric_scores = [float(score) for score in scores]
+        threshold = score_percentile(numeric_scores, percentile) if percentile is not None else (minimum_score if minimum_score is not None else get_settings().confidence_threshold)
         ranked = sorted(zip(scores, candidates), key=lambda pair: pair[0], reverse=True)
         scored = [replace(item, score=float(score)) for score, item in ranked]
         log_top_k("reranker-raw", question, scored, "reranker_score")
-        return [item for item in scored if item.score >= threshold]
+        return [item for item in scored if item.score >= threshold], threshold
+
+    def rerank(self, question: str, candidates: list[RetrievedProvision], minimum_score: float | None = None, percentile: float | None = None) -> list[RetrievedProvision]:
+        """Compatibility helper for callers that only need filtered candidates."""
+        return self.rerank_with_threshold(question, candidates, minimum_score, percentile)[0]
 
 
 @lru_cache(maxsize=1)

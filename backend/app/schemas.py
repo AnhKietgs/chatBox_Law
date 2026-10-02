@@ -40,10 +40,14 @@ class Claim(BaseModel):
 
 class LatencyBreakdown(BaseModel):
     """Server-side timings in milliseconds for one chat request."""
+    contextualization_ms: float = 0
+    query_augmentation_ms: float = 0
     retrieval_ms: float = 0
     rerank_ms: float = 0
     llm_ms: float = 0
     citation_validation_ms: float = 0
+    token_budget_ms: float = 0
+    map_reduce_ms: float = 0
     total_ms: float = 0
 
 

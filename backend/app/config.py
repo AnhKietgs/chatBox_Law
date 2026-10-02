@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,10 +19,14 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "Qwen3.5:2b"
     public_rate_limit_per_minute: int = 20
-    # Calibrated against Vietnamese legal retrieval: a direct Article 301 match
-    # scores about 0.51 while the next unrelated candidate is near 0.12.
+    # Kept only as the legacy fallback when Reranker.rerank() is called directly.
+    # The production retrieval flow below uses a per-query percentile instead.
     confidence_threshold: float = 0.50
     conversation_confidence_threshold: float = 0.30
+    # Dynamic reranker selection: retain candidates at or above this percentile
+    # within the current recall batch. 70 = the top roughly 30% of that batch.
+    rerank_score_percentile: float = Field(default=70, ge=0, le=100)
+    conversation_rerank_score_percentile: float = Field(default=60, ge=0, le=100)
     claim_support_threshold: float = 0.65
     extractive_fallback_threshold: float = 0.50
     index_batch_size: int = 32
@@ -29,7 +34,30 @@ class Settings(BaseSettings):
     retrieval_debug_top_k: int = 8
     conversation_context_messages: int = 6
     conversation_context_max_chars: int = 3000
+    contextualize_retrieval_with_llm: bool = True
+    contextualize_timeout_seconds: float = 30
+    retrieval_augmentation_enabled: bool = True
+    retrieval_augmentation_model: str = ""
+    retrieval_augmentation_timeout_seconds: float = 30
     warm_models_on_startup: bool = True
+    # ------------------------------------------------------------------ #
+    # Context window overflow prevention                                   #
+    # ------------------------------------------------------------------ #
+    # Token budget — estimate = ceil(len / 3.5), conservative for Vietnamese
+    context_model_limit: int = 8192       # total token limit of the model
+    context_reserved_output: int = 1024   # tokens set aside for generated answer
+    context_overhead: int = 256           # JSON wrappers, system markers
+    # Retrieval pool vs. injection limit
+    retrieval_recall_pool: int = 20       # candidates retrieved for reranking
+    retrieval_inject_limit: int = 5       # top provisions injected into prompt
+    # Map-Reduce (default OFF; enable via MAP_REDUCE_ENABLED=true in .env)
+    map_reduce_enabled: bool = False
+    map_batch_token_limit: int = 2000     # max tokens per map batch
+    map_reduce_timeout_seconds: float = 60.0
+    # Sliding window history + memory summary
+    history_window_turns: int = 5         # recent turns kept verbatim
+    memory_summary_enabled: bool = True   # summarise older turns via LLM
+    memory_summary_max_tokens: int = 150  # target length of the summary paragraph
 
 
 @lru_cache

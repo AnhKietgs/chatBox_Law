@@ -47,6 +47,8 @@ class AnswerGeneration:
     answer: ChatResponse
     llm_ms: float
     citation_validation_ms: float
+    token_budget_ms: float = 0.0
+    map_reduce_ms: float = 0.0
 
 
 def citation_from(item: RetrievedProvision) -> Citation:
@@ -167,11 +169,15 @@ class GroundedAnswerService:
             logger.info("Abstaining because retrieval returned no eligible provision")
             return AnswerGeneration(abstain(as_of), 0, 0)
         logger.info("Generating grounded answer with Ollama chat JSON schema v2 (%d sources)", len(retrieved))
+        settings = get_settings()
+
+        # Build the source list (without score — that key is internal only).
         sources = [{
             "source_id": f"S{index}",
             "citation": f"{item.document.title}, Điều {item.provision.article_no}, Khoản {item.provision.clause_no or '-'}, Điểm {item.provision.point_label or '-'}",
             "text": item.provision.content,
         } for index, item in enumerate(retrieved, start=1)]
+
         system_prompt = (
             "Bạn là trợ lý tra cứu pháp luật Việt Nam. Chỉ dùng các nguồn được cung cấp; "
             "không suy diễn và không viện dẫn nguồn ngoài. Phải tuân thủ JSON Schema đã được cung cấp. "
@@ -186,13 +192,75 @@ class GroundedAnswerService:
             "abstain=true, answer='Không đủ căn cứ pháp lý từ các nguồn được cung cấp.', claims=[] và warnings=[]. "
             "Không viết Markdown, giải thích ngoài JSON hoặc phần suy luận."
         )
+
+        # ------------------------------------------------------------------ #
+        # Strategy 1: Token budget — measure before injecting                 #
+        # ------------------------------------------------------------------ #
+        from .token_budget import TokenBudget
+        from .map_reduce import MapReduceSummarizer
+
+        budget_started = perf_counter()
+        tb = TokenBudget(
+            settings.context_model_limit,
+            settings.context_reserved_output,
+            settings.context_overhead,
+        )
+        # fixed_text = everything in the prompt except the source list
+        fixed_text = (
+            system_prompt
+            + f"\nNgày áp dụng: {as_of.isoformat()}."
+            + f"\nLịch sử hội thoại: {conversation_context or '(không có)'}"
+            + f"\nCâu hỏi hiện tại: {question}"
+        )
+        sources_fitted, was_truncated = tb.fit_sources_to_budget(sources, fixed_text)
+        token_budget_ms = (perf_counter() - budget_started) * 1000
+
+        # ------------------------------------------------------------------ #
+        # Strategy 3: Map-Reduce fallback when truncated and enabled          #
+        # ------------------------------------------------------------------ #
+        map_reduce_ms = 0.0
+        if was_truncated:
+            logger.warning(
+                "TokenBudget: %d/%d sources fit in prompt budget (map_reduce_enabled=%s)",
+                len(sources_fitted), len(sources), settings.map_reduce_enabled,
+            )
+            if settings.map_reduce_enabled:
+                mr_started = perf_counter()
+                mr_result = await MapReduceSummarizer().summarize(
+                    question=question,
+                    sources=sources,          # full list, not just fitted
+                    target_token_budget=tb.available(fixed_text),
+                )
+                map_reduce_ms = (perf_counter() - mr_started) * 1000
+                if mr_result.merged_text:
+                    logger.info(
+                        "MapReduce: replaced %d sources with %d-batch summary (%d tokens)",
+                        len(sources), mr_result.batch_count, mr_result.total_input_tokens,
+                    )
+                    # Map-Reduce tạo ra synthetic source — citation validation sẽ
+                    # không thể verify S1 synthetic này với retrieved provisions gốc.
+                    # Dùng extractive_fallback từ top-1 retrieved provision (đã verified).
+                    return AnswerGeneration(
+                        extractive_fallback(retrieved, as_of, fallback_minimum_score),
+                        0, 0, token_budget_ms, map_reduce_ms,
+                    )
+                else:
+                    logger.warning("MapReduce produced empty result; using fitted subset")
+
         user_prompt = (
             f"Ngày áp dụng: {as_of.isoformat()}. "
             f"Lịch sử hội thoại (không phải căn cứ pháp lý): {conversation_context or '(không có)'}\n"
             f"Câu hỏi hiện tại: {question}\n"
-            f"Nguồn: {json.dumps(sources, ensure_ascii=False)}"
+            f"Nguồn: {json.dumps(sources_fitted, ensure_ascii=False)}"
         )
-        settings = get_settings()
+
+        if not sources_fitted:
+            logger.warning("No sources fit the token budget; returning extractive fallback")
+            return AnswerGeneration(
+                extractive_fallback(retrieved, as_of, fallback_minimum_score),
+                0, 0, token_budget_ms, map_reduce_ms,
+            )
+
         llm_started = perf_counter()
         try:
             import httpx
@@ -223,16 +291,25 @@ class GroundedAnswerService:
                         body.get("done_reason"),
                         body.get("eval_count"),
                     )
-                    return AnswerGeneration(extractive_fallback(retrieved, as_of, fallback_minimum_score), (perf_counter() - llm_started) * 1000, 0)
+                    return AnswerGeneration(
+                        extractive_fallback(retrieved, as_of, fallback_minimum_score),
+                        (perf_counter() - llm_started) * 1000, 0, token_budget_ms, map_reduce_ms,
+                    )
         except Exception as exc:
             logger.warning("Ollama generation failed; returning safe abstention: %s", exc)
-            return AnswerGeneration(extractive_fallback(retrieved, as_of, fallback_minimum_score), (perf_counter() - llm_started) * 1000, 0)
+            return AnswerGeneration(
+                extractive_fallback(retrieved, as_of, fallback_minimum_score),
+                (perf_counter() - llm_started) * 1000, 0, token_budget_ms, map_reduce_ms,
+            )
         llm_ms = (perf_counter() - llm_started) * 1000
         validation_started = perf_counter()
         answer = validate_model_answer(raw, retrieved, as_of, question)
         if answer.status == "abstained":
-            answer = extractive_fallback(retrieved, as_of, fallback_minimum_score)
+            # Dùng extractive_fallback_threshold từ config (0.50) thay vì
+            # retrieval.minimum_score (percentile reranker ~0.003) — tránh
+            # trả ra source không liên quan khi LLM đã abstain.
+            answer = extractive_fallback(retrieved, as_of, minimum_score=None)
         elif not claims_are_supported(answer, retrieved):
             logger.warning("Rejected LLM output: a claim is not supported by its cited excerpt")
             answer = extractive_fallback(retrieved, as_of, fallback_minimum_score)
-        return AnswerGeneration(answer, llm_ms, (perf_counter() - validation_started) * 1000)
+        return AnswerGeneration(answer, llm_ms, (perf_counter() - validation_started) * 1000, token_budget_ms, map_reduce_ms)

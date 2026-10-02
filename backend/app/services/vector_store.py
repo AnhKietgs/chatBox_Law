@@ -80,12 +80,24 @@ class HybridVectorStore:
             ],
         )
 
-    def search(self, question: str, as_of_iso: str, limit: int = 16, expansion_query: str | None = None):
+    def search(
+        self,
+        question: str,
+        as_of_iso: str,
+        limit: int = 16,
+        expansion_query: str | None = None,
+        additional_queries: list[str] | None = None,
+        hyde_query: str | None = None,
+    ):
         self.ensure_collection()
         queries = [question]
         if expansion_query and expansion_query != question:
             queries.append(expansion_query)
-        dense, sparse = self.embedder.encode(queries)
+        for query in additional_queries or []:
+            if query and query not in queries:
+                queries.append(query)
+        embedded_texts = [*queries, *([hyde_query] if hyde_query and hyde_query not in queries else [])]
+        dense, sparse = self.embedder.encode(embedded_texts)
         # Effective-date validation is repeated from PostgreSQL after recall. That
         # is authoritative and handles open-ended versions without Qdrant date
         # serialization assumptions.
@@ -100,6 +112,13 @@ class HybridVectorStore:
                 models.Prefetch(query=dense[index].tolist(), using="dense", filter=effective_filter, limit=limit),
                 models.Prefetch(query=self._sparse_vector(sparse[index]), using="sparse", filter=effective_filter, limit=limit),
             ])
+        # HyDE is a hypothetical passage, so use only its dense embedding. Its
+        # generated words must not influence sparse lexical matching.
+        if len(embedded_texts) > len(queries):
+            hyde_index = len(queries)
+            prefetches.append(
+                models.Prefetch(query=dense[hyde_index].tolist(), using="dense", filter=effective_filter, limit=limit)
+            )
         result = self.client.query_points(
             collection_name=COLLECTION,
             prefetch=prefetches,

@@ -9,10 +9,24 @@ def test_short_in_scope_query_is_expanded_without_replacing_original():
 
 
 def test_short_contract_breach_phrase_expands_to_commercial_penalty_context():
+    # "mức vi phạm hợp đồng" không có tín hiệu thương mại (mua bán, hàng hóa...)
+    # nên KHÔNG expand sang "hợp đồng thương mại" — tránh domain drift.
+    # Chỉ expand phần phạt/chế tài vì có từ "vi phạm".
     result = expand_commercial_query("mức vi phạm hợp đồng")
     assert result.applied is True
     assert "chế tài vi phạm nghĩa vụ hợp đồng" in result.retrieval_query
+    assert "hợp đồng thương mại mua bán hàng hóa" not in result.retrieval_query
+
+def test_commercial_contract_query_does_expand():
+    # Có tín hiệu thương mại rõ ràng → được expand sang domain thương mại
+    result = expand_commercial_query("vi phạm hợp đồng mua bán hàng hóa")
+    assert result.applied is True
     assert "hợp đồng thương mại mua bán hàng hóa" in result.retrieval_query
+
+def test_labor_contract_query_does_not_expand_to_commercial():
+    # "hợp đồng lao động" có tín hiệu lao động → KHÔNG drift sang thương mại
+    result = expand_commercial_query("vi phạm hợp đồng lao động thử việc")
+    assert "hợp đồng thương mại mua bán hàng hóa" not in result.retrieval_query
 
 
 def test_detailed_in_scope_query_has_focused_legal_anchors():

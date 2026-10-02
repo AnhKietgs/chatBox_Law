@@ -5,6 +5,16 @@ import type { Answer, Citation, Job, Review, Version } from './types'
 const HISTORY_KEY = 'lawrag_chat_history_v1'
 const ACTIVE_CONVERSATION_KEY = 'lawrag_active_conversation_id'
 const HISTORY_LIMIT = 20
+const TRANSCRIPT_TURN_LIMIT = 20
+
+type ChatTurn = {
+  id: string
+  question: string
+  asOfDate: string
+  answer: Answer
+  endToEndMs: number
+  createdAt: string
+}
 
 type HistoryEntry = {
   id: string
@@ -19,6 +29,7 @@ type HistoryEntry = {
   turnCount: number
   questions: string[]
   conversationId?: string
+  turns?: ChatTurn[]
 }
 
 function loadHistory(): HistoryEntry[] {
@@ -30,9 +41,34 @@ function loadHistory(): HistoryEntry[] {
     const ordered = (value as HistoryEntry[]).sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''))
     for (const item of ordered) {
       const key = item.conversationId || `legacy-${item.id}`
-      const normalized: HistoryEntry = { ...item, lastQuestion: item.lastQuestion || item.question, updatedAt: item.updatedAt || item.createdAt, turnCount: item.turnCount || 1, questions: item.questions?.length ? item.questions : [item.question] }
+      const legacyTurn: ChatTurn = {
+        id: `legacy-${item.id}`,
+        question: item.lastQuestion || item.question,
+        asOfDate: item.asOfDate || '',
+        answer: item.answer,
+        endToEndMs: item.endToEndMs || 0,
+        createdAt: item.updatedAt || item.createdAt,
+      }
+      const normalized: HistoryEntry = {
+        ...item,
+        lastQuestion: item.lastQuestion || item.question,
+        updatedAt: item.updatedAt || item.createdAt,
+        turnCount: item.turnCount || 1,
+        questions: item.questions?.length ? item.questions : [item.question],
+        turns: item.turns?.length ? item.turns.slice(-TRANSCRIPT_TURN_LIMIT) : [legacyTurn],
+      }
       const existing = grouped.get(key)
-      grouped.set(key, existing ? { ...existing, lastQuestion: normalized.lastQuestion, asOfDate: normalized.asOfDate, answer: normalized.answer, endToEndMs: normalized.endToEndMs, updatedAt: normalized.updatedAt, turnCount: existing.turnCount + normalized.turnCount, questions: [...existing.questions, ...normalized.questions] } : normalized)
+      grouped.set(key, existing ? {
+        ...existing,
+        lastQuestion: normalized.lastQuestion,
+        asOfDate: normalized.asOfDate,
+        answer: normalized.answer,
+        endToEndMs: normalized.endToEndMs,
+        updatedAt: normalized.updatedAt,
+        turnCount: existing.turnCount + normalized.turnCount,
+        questions: [...existing.questions, ...normalized.questions],
+        turns: [...(existing.turns || []), ...(normalized.turns || [])].slice(-TRANSCRIPT_TURN_LIMIT),
+      } : normalized)
     }
     return [...grouped.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, HISTORY_LIMIT)
   } catch {
@@ -55,45 +91,50 @@ function CitationCard({ citation }: { citation: Citation }) {
 function Chat() {
   const [question, setQuestion] = useState('')
   const [asOfDate, setAsOfDate] = useState('')
-  const [answer, setAnswer] = useState<Answer | null>(null)
-  const [endToEndMs, setEndToEndMs] = useState<number | null>(null)
   const [history, setHistory] = useState<HistoryEntry[]>(loadHistory)
   const [selectedHistoryId, setSelectedHistoryId] = useState('')
   const [conversationId, setConversationId] = useState(() => localStorage.getItem(ACTIVE_CONVERSATION_KEY) || '')
+  const [turns, setTurns] = useState<ChatTurn[]>([])
+  const [pendingQuestion, setPendingQuestion] = useState('')
   const [loading, setLoading] = useState(false)
   const [clearingConversation, setClearingConversation] = useState(false)
   const [error, setError] = useState('')
-  // Citations are already server-validated. Keep this filter in the UI as a
-  // second guard so the user only sees sources that support a generated claim.
-  const citedIds = answer ? new Set(answer.claims.flatMap(claim => claim.citation_ids)) : new Set<string>()
-  const supportingCitations = answer ? answer.citations.filter(citation => citedIds.has(citation.id)) : []
+
   useEffect(() => { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)) }, [history])
   useEffect(() => { if (conversationId) localStorage.setItem(ACTIVE_CONVERSATION_KEY, conversationId); else localStorage.removeItem(ACTIVE_CONVERSATION_KEY) }, [conversationId])
+  useEffect(() => {
+    if (!conversationId || turns.length) return
+    const active = history.find(entry => entry.conversationId === conversationId)
+    if (active?.turns?.length) { setTurns(active.turns); setSelectedHistoryId(active.id) }
+  }, [conversationId, history, turns.length])
+
   const submit = async () => {
-    if (clearingConversation) return
-    setLoading(true); setError(''); setAnswer(null); setEndToEndMs(null)
+    const submittedQuestion = question.trim()
+    if (clearingConversation || loading || submittedQuestion.length < 8) return
+    setLoading(true); setError(''); setPendingQuestion(submittedQuestion); setQuestion('')
     try {
-      const result = await ask(question, asOfDate, conversationId)
-      setAnswer(result.answer)
-      setEndToEndMs(result.endToEndMs)
+      const result = await ask(submittedQuestion, asOfDate, conversationId)
       const nextConversationId = result.answer.conversation_id || conversationId
       setConversationId(nextConversationId)
       const now = new Date().toISOString()
+      const nextTurn: ChatTurn = { id: crypto.randomUUID(), question: submittedQuestion, asOfDate, answer: result.answer, endToEndMs: result.endToEndMs, createdAt: now }
+      setTurns(current => [...current, nextTurn].slice(-TRANSCRIPT_TURN_LIMIT))
       const existingEntry = history.find(item => item.conversationId === nextConversationId)
       const entryId = existingEntry?.id || crypto.randomUUID()
       setHistory(items => {
         const existing = items.find(item => item.conversationId === nextConversationId)
         const entry: HistoryEntry = existing
-          ? { ...existing, lastQuestion: question.trim(), asOfDate, answer: result.answer, endToEndMs: result.endToEndMs, updatedAt: now, turnCount: existing.turnCount + 1, questions: [...existing.questions, question.trim()] }
-          : { id: entryId, question: question.trim(), lastQuestion: question.trim(), asOfDate, answer: result.answer, endToEndMs: result.endToEndMs, createdAt: now, updatedAt: now, turnCount: 1, questions: [question.trim()], conversationId: nextConversationId || undefined }
+          ? { ...existing, lastQuestion: submittedQuestion, asOfDate, answer: result.answer, endToEndMs: result.endToEndMs, updatedAt: now, turnCount: existing.turnCount + 1, questions: [...existing.questions, submittedQuestion], turns: [...(existing.turns || []), nextTurn].slice(-TRANSCRIPT_TURN_LIMIT) }
+          : { id: entryId, question: submittedQuestion, lastQuestion: submittedQuestion, asOfDate, answer: result.answer, endToEndMs: result.endToEndMs, createdAt: now, updatedAt: now, turnCount: 1, questions: [submittedQuestion], turns: [nextTurn], conversationId: nextConversationId || undefined }
         return [entry, ...items.filter(item => item.id !== entry.id)].slice(0, HISTORY_LIMIT)
       })
       setSelectedHistoryId(entryId)
-      setQuestion('')
-    } catch (err) { setError(err instanceof Error ? err.message : 'Đã có lỗi xảy ra') } finally { setLoading(false) }
+    } catch (err) { setError(err instanceof Error ? err.message : 'Đã có lỗi xảy ra') }
+    finally { setLoading(false); setPendingQuestion('') }
   }
   const openHistory = (entry: HistoryEntry) => {
-    setAnswer(entry.answer); setEndToEndMs(entry.endToEndMs); setSelectedHistoryId(entry.id); setConversationId(entry.conversationId || ''); setError('')
+    setTurns(entry.turns?.length ? entry.turns : [{ id: `legacy-${entry.id}`, question: entry.lastQuestion || entry.question, asOfDate: entry.asOfDate, answer: entry.answer, endToEndMs: entry.endToEndMs, createdAt: entry.updatedAt }])
+    setSelectedHistoryId(entry.id); setConversationId(entry.conversationId || ''); setError(''); setQuestion('')
   }
   const deleteHistory = async (entry: HistoryEntry) => {
     const removesActiveConversation = conversationId === entry.conversationId || selectedHistoryId === entry.id
@@ -106,7 +147,7 @@ function Chat() {
     finally { setClearingConversation(false) }
   }
   const startNewChat = () => {
-    setQuestion(''); setAsOfDate(''); setAnswer(null); setEndToEndMs(null); setError(''); setSelectedHistoryId(''); setConversationId('')
+    setQuestion(''); setAsOfDate(''); setTurns([]); setPendingQuestion(''); setError(''); setSelectedHistoryId(''); setConversationId('')
   }
   const clearHistory = async () => {
     startNewChat()
@@ -118,6 +159,19 @@ function Chat() {
     } catch (err) { setError(err instanceof Error ? err.message : 'Không thể xóa lịch sử') }
     finally { setClearingConversation(false) }
   }
+  const AssistantTurn = ({ turn }: { turn: ChatTurn }) => {
+    const citedIds = new Set(turn.answer.claims.flatMap(claim => claim.citation_ids))
+    const citations = turn.answer.citations.filter(citation => citedIds.has(citation.id))
+    return <div className={`message assistant-message ${turn.answer.status}`}>
+      <span>{turn.answer.status === 'grounded' ? `Có căn cứ · áp dụng ${turn.answer.applied_as_of_date}` : 'Chưa đủ căn cứ'}</span>
+      <p className="answer-text">{turn.answer.answer}</p>
+      {citations.length > 0 && <details className="message-sources"><summary>Căn cứ pháp lý ({citations.length})</summary><div className="citations">{citations.map(citation => <CitationCard citation={citation} key={citation.id} />)}</div></details>}
+      {turn.answer.warnings.map((warning, index) => <p className="warning" key={index}>{warning}</p>)}
+      <p className="latency">Phản hồi trong {(turn.endToEndMs / 1000).toFixed(2)} giây</p>
+      {turn.answer.latency && <details className="latency-breakdown"><summary>Chi tiết độ trễ</summary><ul><li>Contextualize: {turn.answer.latency.contextualization_ms.toFixed(0)} ms</li><li>HyDE + MultiQuery: {turn.answer.latency.query_augmentation_ms.toFixed(0)} ms</li><li>Retrieval: {turn.answer.latency.retrieval_ms.toFixed(0)} ms</li><li>Rerank: {turn.answer.latency.rerank_ms.toFixed(0)} ms</li><li>LLM: {turn.answer.latency.llm_ms.toFixed(0)} ms</li></ul></details>}
+    </div>
+  }
+
   return <div className="chat-shell">
     <aside className="chat-history" aria-label="Lịch sử câu hỏi">
       <div className="history-heading"><h2>Lịch sử hỏi đáp</h2><div className="history-actions"><button className="history-new" type="button" disabled={clearingConversation} onClick={startNewChat}>Đoạn chat mới</button>{history.length > 0 && <button className="history-clear" type="button" disabled={clearingConversation} onClick={() => void clearHistory()}>Xóa tất cả</button>}</div></div>
@@ -125,22 +179,18 @@ function Chat() {
       <p className="history-note">Xóa một mục sẽ xóa ngữ cảnh đoạn chat đó.</p>
     </aside>
     <main className="chat-page">
-    <nav><span className="brand">ChatBot Luật RAG</span><a href="#admin">Quản trị kho luật</a></nav>
-    <form className="ask" onSubmit={event => { event.preventDefault(); void submit() }}>
-      <label>Câu hỏi pháp lý<textarea value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (!loading && !clearingConversation && question.trim().length >= 8) void submit() } }} minLength={8} required placeholder="Ví dụ: Mức phạt vi phạm hợp đồng mua bán hàng hóa tối đa là bao nhiêu?" /></label>
-      <small>Enter để hỏi · Shift + Enter để xuống dòng</small>
-      <button disabled={loading || clearingConversation}>{loading ? 'Đang đối chiếu nguồn…' : clearingConversation ? 'Đang xóa đoạn chat…' : 'Hỏi pháp luật'}</button>
-    </form>
-    {error && <p className="error">{error}</p>}
-    {answer && <section className={`answer ${answer.status}`}>
-      <div className="answer-state">{answer.status === 'grounded' ? `Có căn cứ · áp dụng ${answer.applied_as_of_date}` : 'Chưa đủ căn cứ'}</div>
-      {endToEndMs !== null && <p className="latency">Phản hồi trong {(endToEndMs / 1000).toFixed(2)} giây · Server xử lý {((answer.latency?.total_ms ?? 0) / 1000).toFixed(2)} giây</p>}
-      <p className="answer-text">{answer.answer}</p>
-      {supportingCitations.length > 0 && <><h2>Căn cứ pháp lý</h2><div className="citations">{supportingCitations.map(c => <div id={`cite-${c.id}`} key={c.id}><CitationCard citation={c} /></div>)}</div></>}
-      {answer.warnings.map((warning, i) => <p className="warning" key={i}>{warning}</p>)}
-      {answer.latency && <details className="latency-breakdown"><summary>Chi tiết độ trễ máy chủ</summary><ul><li>Retrieval: {answer.latency.retrieval_ms.toFixed(0)} ms</li><li>Rerank: {answer.latency.rerank_ms.toFixed(0)} ms</li><li>LLM: {answer.latency.llm_ms.toFixed(0)} ms</li><li>Kiểm tra citation: {answer.latency.citation_validation_ms.toFixed(0)} ms</li></ul></details>}
-    </section>}
-    <footer>Thông tin tra cứu mang tính tham khảo, không thay thế tư vấn luật sư cho tình huống cụ thể.</footer>
+      <nav><span className="brand">ChatBot Luật RAG</span><a href="#admin">Quản trị kho luật</a></nav>
+      <section className="chat-transcript" aria-live="polite">
+        {turns.length === 0 && !pendingQuestion && <div className="chat-welcome"><h1>Xin chào</h1></div>}
+        {turns.map(turn => <div className="turn" key={turn.id}><div className="message user-message"><span>Bạn</span><p>{turn.question}</p></div><AssistantTurn turn={turn} /></div>)}
+        {pendingQuestion && <div className="turn"><div className="message user-message"><span>Bạn</span><p>{pendingQuestion}</p></div><div className="message assistant-message pending-message"><span>ChatBot Luật</span><p>Đang đối chiếu nguồn pháp lý…</p></div></div>}
+      </section>
+      {error && <p className="error">{error}</p>}
+      <form className="ask composer" onSubmit={event => { event.preventDefault(); void submit() }}>
+        <textarea aria-label="Câu hỏi pháp lý" value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit() } }} minLength={8} required placeholder="Nhập câu hỏi pháp lý của bạn…" />
+        <div className="composer-actions"><small>Enter để gửi · Shift + Enter để xuống dòng</small><input aria-label="Thời điểm áp dụng" title="Để trống để dùng quy định hiện hành" type="date" value={asOfDate} onChange={e => setAsOfDate(e.target.value)} /><button disabled={loading || clearingConversation || question.trim().length < 8}>{loading ? 'Đang trả lời…' : 'Gửi'}</button></div>
+      </form>
+      <footer>Thông tin tra cứu mang tính tham khảo, không thay thế tư vấn luật sư cho tình huống cụ thể.</footer>
     </main>
   </div>
 }

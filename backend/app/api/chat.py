@@ -3,15 +3,18 @@ import logging
 from time import perf_counter
 from uuid import UUID
 from fastapi import APIRouter, Depends, Request, Response, status
-from sqlalchemy import delete as sql_delete, select
+from sqlalchemy import delete as sql_delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from ..database import get_db
 from ..config import get_settings
 from ..rate_limit import enforce_public_rate_limit
 from ..schemas import ChatQuery, ChatResponse, LatencyBreakdown
-from ..services.answering import GroundedAnswerService
+from ..services.answering import GroundedAnswerService, abstain
 from ..services.conversation import build_conversation_context
+from ..services.contextualization import contextualize_for_retrieval
+from ..services.memory import summarize_history
+from ..services.query_augmentation import augment_for_retrieval, clarification_response, needs_clarification
 from ..services.retrieval import LegalRetriever
 from ..models import ChatMessage, Conversation
 
@@ -61,14 +64,42 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         db.add(conversation)
         db.flush()
     settings = get_settings()
+
+    # ------------------------------------------------------------------ #
+    # Strategy 4: Sliding window — only fetch the N recent turns          #
+    # ------------------------------------------------------------------ #
+    window_msg_count = settings.history_window_turns * 2  # user + assistant per turn
     prior_messages = list(db.scalars(
         select(ChatMessage)
         .where(ChatMessage.conversation_id == conversation.id)
         .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-        .limit(settings.conversation_context_messages)
+        .limit(window_msg_count)
     ))
-    conversation_context = build_conversation_context(reversed(prior_messages), settings.conversation_context_max_chars)
-    retrieval = LegalRetriever(db).retrieve_with_metrics(payload.question, applied_date, conversation_context=conversation_context)
+    conversation_context = build_conversation_context(
+        reversed(prior_messages),
+        settings.conversation_context_max_chars,
+        memory_summary=conversation.memory_summary,
+        window_turns=settings.history_window_turns,
+    )
+    if needs_clarification(payload.question, bool(conversation_context)):
+        answer = abstain(applied_date)
+        answer.answer = clarification_response()
+        answer.warnings = ["Không suy đoán chủ thể hoặc nội dung pháp lý khi câu hỏi chưa đủ rõ."]
+        answer.conversation_id = save_turn(db, conversation, payload.question, answer.answer)
+        answer.latency = LatencyBreakdown(total_ms=round((perf_counter() - started) * 1000, 1))
+        logger.info("Chat abstained before retrieval because the question has an unresolved reference")
+        return answer
+    contextualized = await contextualize_for_retrieval(payload.question, conversation_context)
+    augmentation = await augment_for_retrieval(contextualized.retrieval_query)
+    retrieval = LegalRetriever(db).retrieve_with_metrics(
+        payload.question,
+        applied_date,
+        inject_limit=settings.retrieval_inject_limit,
+        conversation_context=conversation_context,
+        standalone_query=contextualized.retrieval_query,
+        additional_queries=augmentation.query_variants,
+        hyde_query=augmentation.hypothetical_document,
+    )
     logger.info("Chat retrieval returned %d grounded provisions for %s", len(retrieval.provisions), applied_date.isoformat())
     generation = await GroundedAnswerService().generate(
         payload.question,
@@ -78,20 +109,59 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         fallback_minimum_score=retrieval.minimum_score,
     )
     generation.answer.conversation_id = save_turn(db, conversation, payload.question, generation.answer.answer)
+
+    # ------------------------------------------------------------------ #
+    # Strategy 4 (cont.): Memory summary — condense turns outside window  #
+    # ------------------------------------------------------------------ #
+    if settings.memory_summary_enabled:
+        total_messages = db.scalar(
+            select(func.count(ChatMessage.id))
+            .where(ChatMessage.conversation_id == conversation.id)
+        )
+        if total_messages is not None and total_messages > window_msg_count:
+            old_messages = list(db.scalars(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == conversation.id)
+                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                .limit(total_messages - window_msg_count)
+            ))
+            try:
+                memory_update = await summarize_history(old_messages, conversation.memory_summary)
+                if memory_update.summary:
+                    conversation.memory_summary = memory_update.summary
+                    db.commit()
+                    logger.info(
+                        "Memory summary updated: %d old turns condensed (%.0fms)",
+                        memory_update.turns_summarized,
+                        memory_update.llm_ms,
+                    )
+            except Exception as exc:
+                logger.warning("Memory summarization failed (non-fatal): %s", exc)
+
     generation.answer.latency = LatencyBreakdown(
+        contextualization_ms=round(contextualized.llm_ms, 1),
+        query_augmentation_ms=round(augmentation.llm_ms, 1),
         retrieval_ms=round(retrieval.retrieval_ms, 1),
         rerank_ms=round(retrieval.rerank_ms, 1),
         llm_ms=round(generation.llm_ms, 1),
         citation_validation_ms=round(generation.citation_validation_ms, 1),
+        token_budget_ms=round(generation.token_budget_ms, 1),
+        map_reduce_ms=round(generation.map_reduce_ms, 1),
         total_ms=round((perf_counter() - started) * 1000, 1),
     )
     logger.info(
-        "Chat latency total=%.1fms retrieval=%.1fms rerank=%.1fms llm=%.1fms citation=%.1fms",
+        "Chat latency total=%.1fms contextualize=%.1fms augment=%.1fms "
+        "retrieval=%.1fms rerank=%.1fms llm=%.1fms citation=%.1fms "
+        "token_budget=%.1fms map_reduce=%.1fms",
         generation.answer.latency.total_ms,
+        generation.answer.latency.contextualization_ms,
+        generation.answer.latency.query_augmentation_ms,
         generation.answer.latency.retrieval_ms,
         generation.answer.latency.rerank_ms,
         generation.answer.latency.llm_ms,
         generation.answer.latency.citation_validation_ms,
+        generation.answer.latency.token_budget_ms,
+        generation.answer.latency.map_reduce_ms,
     )
     return generation.answer
 

@@ -7,3 +7,5 @@ node_modules/
 dist/
 uploads/
 
+# GENESIS client project credentials — never commit.
+.agentbox/.project-auth

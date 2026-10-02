@@ -1,0 +1,5 @@
+# Docling 2.21 permits broad <3/<4 ranges. These compatible lower bounds keep
+# its resolver deterministic instead of testing every newer 2.x/3.x release.
+docling==2.21.0
+docling-core[chunking]==2.18.1
+docling-ibm-models==3.3.2

@@ -1,0 +1,4 @@
+# OCR engines are installed separately from Docling to avoid a NumPy/OpenCV
+# resolver cross-product with document-parser dependencies.
+rapidocr-onnxruntime==1.4.4
+paddleocr==2.9.1

@@ -46,3 +46,21 @@ def test_reranker_drops_results_below_normalized_confidence_threshold(monkeypatc
     assert len(result) == 1
     assert result[0].provision.article_no == "301"
     assert result[0].score == 0.92
+
+
+def test_reranker_uses_the_current_batch_percentile(monkeypatch):
+    class FakeReranker:
+        def compute_score(self, pairs, normalize):
+            assert normalize is True
+            return [0.92, 0.74, 0.62, 0.40, 0.12]
+
+    monkeypatch.setattr(retrieval, "get_reranker_model", lambda: FakeReranker())
+    kept, threshold = retrieval.Reranker().rerank_with_threshold(
+        "Mức phạt vi phạm là bao nhiêu?",
+        [candidate(str(index), f"Nội dung {index}") for index in range(5)],
+        percentile=70,
+    )
+
+    # np.percentile([.12, .40, .62, .74, .92], 70) = .716
+    assert round(threshold, 3) == 0.716
+    assert [item.score for item in kept] == [0.92, 0.74]

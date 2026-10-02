@@ -1,0 +1,5 @@
+# Kept as the complete ML dependency manifest for local development.
+# Docker installs these two groups in separate layers to prevent pip's resolver
+# from combining FlagEmbedding/ir-datasets with Docling/OCR dependency ranges.
+-r requirements-embedding.txt
+-r requirements-parser-ocr.txt

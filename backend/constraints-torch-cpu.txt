@@ -1,0 +1,4 @@
+# Force every resolver pass (FlagEmbedding, Docling and EasyOCR) to retain
+# CPU wheels. The +cpu local versions are supplied by the PyTorch CPU index.
+torch==2.6.0+cpu
+torchvision==0.21.0+cpu
