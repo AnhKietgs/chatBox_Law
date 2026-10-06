@@ -5,4 +5,5 @@ export type Answer = { status: 'grounded' | 'abstained'; answer: string; claims:
 export type Version = { id: string; document_code: string; document_title: string; version_label: string; effective_from: string; effective_to?: string; status: string; official_url: string }
 export type Job = { id: string; version_id: string; status: string; progress: number; message?: string }
 export type Provision = { id: string; article_no: string; clause_no?: string; point_label?: string; heading?: string; content: string; ordinal: number }
+export type ProvisionPage = { version_id: string; total: number; offset: number; limit: number; provisions: Provision[] }
 export type Review = { version_id: string; provision_count: number; structure_hash: string; provisions: Provision[] }

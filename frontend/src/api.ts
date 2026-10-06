@@ -1,4 +1,4 @@
-import type { Answer, Job, Review, Version } from './types'
+import type { Answer, Job, ProvisionPage, Review, Version } from './types'
 const jsonHeaders = { 'Content-Type': 'application/json' }
 
 type ValidationIssue = { loc?: Array<string | number>; msg?: string }
@@ -60,6 +60,11 @@ export async function job(token: string, id: string): Promise<Job> {
 export async function reviewVersion(token: string, id: string): Promise<Review> {
   const response = await fetch(`/api/v1/admin/versions/${id}/review`, { headers: { Authorization: `Bearer ${token}` } })
   if (!response.ok) throw await responseError(response, 'Không thể tải cấu trúc văn bản')
+  return response.json()
+}
+export async function publishedChunks(token: string, id: string, offset = 0, limit = 50): Promise<ProvisionPage> {
+  const response = await fetch(`/api/v1/admin/versions/${id}/chunks?offset=${offset}&limit=${limit}`, { headers: { Authorization: `Bearer ${token}` } })
+  if (!response.ok) throw await responseError(response, 'Không thể tải các chunk đã xuất bản')
   return response.json()
 }
 export async function publish(token: string, id: string, reviewedStructureHash: string) {

@@ -3,14 +3,14 @@ import hashlib
 from pathlib import Path
 from uuid import UUID, uuid4
 from urllib.parse import urlparse
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from ..celery_app import celery
 from ..config import get_settings
 from ..database import get_db
 from ..models import IngestionJob, JobStatus, LegalDocument, LegalProvision, LegalVersion, VersionStatus
-from ..schemas import JobSummary, ProvisionSummary, PublishRequest, ReviewSummary, TokenRequest, TokenResponse, VersionSummary
+from ..schemas import JobSummary, ProvisionPage, ProvisionSummary, PublishRequest, ReviewSummary, TokenRequest, TokenResponse, VersionSummary
 from ..security import issue_token, require_admin
 from ..services.ingestion import publish_version, reindex_version
 from ..services.storage import ObjectStorage
@@ -133,6 +133,43 @@ def list_provisions(version_id: UUID, _: str = Depends(require_admin), db: Sessi
         raise HTTPException(status_code=404, detail="Không tìm thấy phiên bản")
     rows = db.scalars(select(LegalProvision).where(LegalProvision.version_id == version_id).order_by(LegalProvision.ordinal)).all()
     return [provision_summary(row) for row in rows]
+
+
+@router.get("/versions/{version_id}/chunks", response_model=ProvisionPage)
+def list_published_chunks(
+    version_id: UUID,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    _: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> ProvisionPage:
+    """Show exactly the chunks indexed from a published version, page by page.
+
+    Keeping this separate from the pre-publish review endpoint prevents the
+    admin UI from downloading thousands of chunks at once for a long code.
+    """
+    version = db.get(LegalVersion, version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="Không tìm thấy phiên bản")
+    if version.status != VersionStatus.published:
+        raise HTTPException(status_code=422, detail="Chỉ xem chunk của phiên bản đã xuất bản")
+
+    where = LegalProvision.version_id == version_id
+    total = db.scalar(select(func.count()).select_from(LegalProvision).where(where)) or 0
+    rows = db.scalars(
+        select(LegalProvision)
+        .where(where)
+        .order_by(LegalProvision.ordinal)
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    return ProvisionPage(
+        version_id=version_id,
+        total=total,
+        offset=offset,
+        limit=limit,
+        provisions=[provision_summary(row) for row in rows],
+    )
 
 
 @router.get("/versions/{version_id}/review", response_model=ReviewSummary)

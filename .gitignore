@@ -6,6 +6,9 @@ __pycache__/
 node_modules/
 dist/
 uploads/
-
+venv/
+.venv/
+env/
 # GENESIS client project credentials — never commit.
 .agentbox/.project-auth
+.agentbox/

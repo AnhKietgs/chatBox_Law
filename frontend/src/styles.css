@@ -77,4 +77,9 @@ small, .muted { color: #5d6962; font-weight: 400; }
 .provision p { white-space: pre-wrap; }
 .review-check { display: flex; align-items: flex-start; gap: .5rem; margin-top: .8rem; font-weight: 500; }
 .review-check input { width: auto; margin-top: .3rem; }
+.published-chunks { max-width: 780px; margin-top: 1rem; padding: 1rem; border: 1px solid #dce9e1; border-radius: 10px; background: #fbfcfa; }
+.published-chunks h3 { margin: 0; color: #0b6049; font-size: 1rem; }
+.published-chunks > p { margin: .35rem 0 .75rem; }
+.chunk-pagination { display: flex; justify-content: space-between; gap: .6rem; margin-top: .9rem; }
+.chunk-pagination button { margin: 0; }
 @media (max-width: 760px) { .chat-shell { display: block; } .chat-history { position: static; height: auto; } .history-heading { grid-template-columns: 1fr auto; align-items: center; } .chat-history ul { max-height: 180px; overflow-y: auto; } .chat-page, .admin-page { width: min(100% - 1rem, 960px); } .chat-transcript { padding-top: 1rem; } .message { max-width: 94%; } .composer-actions { flex-wrap: wrap; } .composer-actions small { order: 3; flex-basis: 100%; } .upload { grid-template-columns: 1fr; } .citation-top, .version { display: block; } }

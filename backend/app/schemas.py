@@ -83,6 +83,16 @@ class ProvisionSummary(BaseModel):
     ordinal: int
 
 
+class ProvisionPage(BaseModel):
+    """A bounded page of stored legal chunks for the admin audit screen."""
+
+    version_id: UUID
+    total: int
+    offset: int
+    limit: int
+    provisions: list[ProvisionSummary]
+
+
 class ReviewSummary(BaseModel):
     version_id: UUID
     provision_count: int
