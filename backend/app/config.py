@@ -29,7 +29,10 @@ class Settings(BaseSettings):
     conversation_rerank_score_percentile: float = Field(default=75, ge=0, le=100)
     # Absolute floor: nếu top reranker score < giá trị này → abstain ngay,
     # không để LLM thấy source không liên quan rồi sinh câu trả lời sai.
-    reranker_minimum_absolute_score: float = 0.05
+    # 0.20: loại bỏ các case không có văn bản đúng chủ đề (VD: hỏi Luật LĐ
+    # nhưng chỉ tìm được BLDS định nghĩa thời hạn, score ~0.13).
+    # Các case đúng thường ≥ 0.40; ngưỡng 0.20 là buffer an toàn.
+    reranker_minimum_absolute_score: float = 0.20
     claim_support_threshold: float = 0.65
     extractive_fallback_threshold: float = 0.50
     index_batch_size: int = 32

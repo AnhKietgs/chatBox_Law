@@ -38,6 +38,7 @@ class RetrievedProvision:
     version: LegalVersion
     document: LegalDocument
     score: float
+    article_heading: str | None = None  # heading cấp Điều, lấy từ DB batch query
 
 
 @dataclass(frozen=True)
@@ -118,8 +119,38 @@ class LegalRetriever:
             .join(LegalDocument, LegalVersion.document_id == LegalDocument.id)
             .where(LegalProvision.id.in_(ids), LegalVersion.status == VersionStatus.published)
         ).all()
+        # Batch-load heading cấp Điều từ DB cho tất cả provisions trong kết quả.
+        # Cần thiết vì Điều X (clause_no=None, có heading) thường không nằm trong
+        # top-30 recall — nếu build dict từ candidates thì sẽ thiếu. Ví dụ:
+        # Điều 131 K4 cần heading "Hậu quả pháp lý của giao dịch dân sự vô hiệu"
+        # để reranker và LLM hiểu ngữ cảnh, nhưng Điều 131 (điều gốc) không được
+        # recall do content quá ngắn so với query "vô hiệu nhầm lẫn thiệt hại".
+        _version_ids = list({provision.version_id for provision, _, _ in rows})
+        if _version_ids:
+            _heading_rows = self.db.execute(
+                select(LegalProvision.version_id, LegalProvision.article_no, LegalProvision.heading)
+                .where(
+                    LegalProvision.version_id.in_(_version_ids),
+                    LegalProvision.clause_no.is_(None),
+                    LegalProvision.point_label.is_(None),
+                    LegalProvision.heading.isnot(None),
+                )
+            ).all()
+            article_headings_db: dict[tuple[str, str], str] = {
+                (str(row.version_id), row.article_no): row.heading
+                for row in _heading_rows
+            }
+        else:
+            article_headings_db = {}
+
         valid = [
-            RetrievedProvision(provision, version, document, scores[provision.id])
+            RetrievedProvision(
+                provision=provision,
+                version=version,
+                document=document,
+                score=scores[provision.id],
+                article_heading=article_headings_db.get((str(provision.version_id), provision.article_no)),
+            )
             for provision, version, document in rows
             if is_effective(version.effective_from, version.effective_to, as_of)
         ]
@@ -221,18 +252,13 @@ class Reranker:
     ) -> tuple[list[RetrievedProvision], float]:
         if not candidates:
             return [], minimum_score if minimum_score is not None else get_settings().confidence_threshold
-        # Xây bảng heading cấp Điều từ chính candidates (cấp Điều = clause_no là None).
-        # Dùng để inject ngữ cảnh cho khoản/điểm con ngắn, tránh dilute BM25 ở tầng
-        # embedding. VD: Điều 131 K4 "Bên có lỗi..." sẽ được reranker đọc kèm heading
-        # "Hậu quả pháp lý của giao dịch dân sự vô hiệu" → score đúng chỗ.
-        article_headings: dict[str, str] = {
-            item.provision.article_no: item.provision.heading
-            for item in candidates
-            if item.provision.clause_no is None and item.provision.heading
-        }
+        # article_heading đã được batch-load từ DB trong retrieve_with_metrics().
+        # Ưu tiên: article_heading (heading cấp Điều từ DB) > provision.heading > ""
+        # Điều này đảm bảo khoản/điểm ngắn như Điều 131 K4 "Bên có lỗi..." được
+        # reranker đọc kèm "Hậu quả pháp lý của giao dịch dân sự vô hiệu" → score đúng.
         passages = [
             f"Điều {item.provision.article_no}. "
-            f"{article_headings.get(item.provision.article_no, item.provision.heading or '')}\n"
+            f"{item.article_heading or item.provision.heading or ''}\n"
             f"{item.provision.content}"
             for item in candidates
         ]

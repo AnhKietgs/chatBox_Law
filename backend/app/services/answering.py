@@ -19,8 +19,13 @@ logger.setLevel(logging.INFO)
 
 
 def remove_internal_source_labels(text: str) -> str:
-    """Source IDs are for backend citation validation, never for end users."""
-    return re.sub(r"\s*[\(\[]\s*S\d+(?:\s*[,;]\s*S\d+)*\s*[\)\]]", "", text).strip()
+    """Source IDs are for backend citation validation, never for end users.
+    Also strips [HeadingText] prefixes that source_text() injects and LLMs may echo back."""
+    # Strip (S1), [S1], (S1, S2) etc.
+    text = re.sub(r"\s*[\(\[]\s*S\d+(?:\s*[,;]\s*S\d+)*\s*[\)\]]", "", text)
+    # Strip leading [Heading text] injected from source_text() (3–100 chars, not a source ID)
+    text = re.sub(r"^\s*\[(?!S\d)[^\]]{3,100}\]\s*", "", text)
+    return text.strip()
 
 
 def is_question_echo(answer: str, question: str) -> bool:
@@ -163,11 +168,31 @@ def claims_are_supported(answer: ChatResponse, retrieved: list[RetrievedProvisio
     return all(max(float(score) for score in scores[start:end]) >= threshold for start, end in claim_ranges)
 
 
+_FOREIGN_LAW_PATTERNS = (
+    # Tên quốc gia/vùng lãnh thổ + "luật/pháp luật/quy định" theo nhiều thứ tự
+    r"(?:luật|pháp\s*luật|quy\s*định)\s+(?:của\s+)?(?:mỹ|hoa\s*kỳ|anh|pháp|đức|nhật|trung\s*quốc|hàn\s*quốc|eu|liên\s*minh\s*châu\s*âu|singapore|úc|canada)",
+    r"(?:mỹ|hoa\s*kỳ|anh|pháp|đức|nhật|trung\s*quốc|hàn\s*quốc|eu|liên\s*minh\s*châu\s*âu|singapore|úc|canada)\s+(?:luật|pháp\s*luật|quy\s*định)",
+    r"luật\s+(?:mỹ|hoa\s*kỳ|anh|pháp|đức|nhật|trung\s*quốc|hàn\s*quốc|eu)",
+    r"(?:us|uk|eu)\s+law",
+    r"american\s+law",
+    r"common\s+law",
+)
+_FOREIGN_LAW_RE = re.compile("|".join(_FOREIGN_LAW_PATTERNS), re.IGNORECASE)
+
+
 class GroundedAnswerService:
     async def generate(self, question: str, retrieved: list[RetrievedProvision], as_of: date, conversation_context: str = "", fallback_minimum_score: float | None = None, retrieval_query: str | None = None) -> AnswerGeneration:
         if not retrieved:
             logger.info("Abstaining because retrieval returned no eligible provision")
             return AnswerGeneration(abstain(as_of), 0, 0)
+
+        # ── Jurisdiction guard: câu hỏi về pháp luật nước ngoài → abstain ngay ──
+        # LLM nhỏ (≤3B) không thể tự phân biệt jurisdiction qua instruction.
+        # Detect ở code level trước khi gọi LLM để tránh trả nguồn VN cho câu hỏi nước ngoài.
+        if _FOREIGN_LAW_RE.search(question):
+            logger.info("Abstaining: question asks about foreign law — jurisdiction not supported")
+            return AnswerGeneration(abstain(as_of), 0, 0)
+
         settings = get_settings()
 
         # ── Absolute reranker score gate ──────────────────────────────────
@@ -184,11 +209,47 @@ class GroundedAnswerService:
         logger.info("Generating grounded answer with Ollama chat JSON schema v2 (%d sources)", len(retrieved))
 
         # Build the source list (without score — that key is internal only).
+        # Khi provision là khoản/điểm con (clause_no không None), inject heading cấp
+        # Điều vào trước nội dung. Giúp LLM biết ngữ cảnh: VD Điều 131 K4
+        # "Bên có lỗi gây thiệt hại thì phải bồi thường" trở thành
+        # "[Hậu quả pháp lý của giao dịch dân sự vô hiệu] Bên có lỗi..."
+        # → LLM nhận ra đây là hậu quả của vô hiệu, không phải vi phạm hợp đồng thông thường.
+        def source_text(item: RetrievedProvision) -> str:
+            # article_heading = batch-load từ DB (provision cấp Điều, clause_no=None).
+            # Nếu parser không tạo provision cấp Điều riêng mà lưu heading vào từng khoản,
+            # article_heading sẽ là None → fallback về provision.heading của chính khoản đó.
+            # VD: Điều 131 K4: provision.heading = "Hậu quả pháp lý của giao dịch dân sự vô hiệu"
+            # → LLM nhận "[Hậu quả pháp lý...] Bên có lỗi gây thiệt hại thì phải bồi thường."
+            heading = item.article_heading or item.provision.heading
+            if heading and item.provision.clause_no is not None:
+                return f"[{heading}] {item.provision.content}"
+            return item.provision.content
+
         sources = [{
             "source_id": f"S{index}",
             "citation": f"{item.document.title}, Điều {item.provision.article_no}, Khoản {item.provision.clause_no or '-'}, Điểm {item.provision.point_label or '-'}",
-            "text": item.provision.content,
+            "text": source_text(item),
         } for index, item in enumerate(retrieved, start=1)]
+
+        # Reorder sources list trước khi gửi LLM để provisions có heading "Hậu quả pháp lý"
+        # xuất hiện ở đầu context cho câu hỏi về quyền lợi/hậu quả.
+        # Small LLMs (≤3B) có recency/primacy bias — chúng bỏ qua sources ở giữa/cuối.
+        # Source IDs (S1-S7) giữ nguyên → validation trong validate_model_answer không bị ảnh hưởng
+        # (validate_model_answer dùng enumerate(retrieved) độc lập với thứ tự sources list).
+        _consequence_triggers = ("được gì", "có quyền gì", "hậu quả", "xử lý", "được bồi", "quyền lợi")
+        if any(kw in question.lower() for kw in _consequence_triggers):
+            _hq_kw = ("hậu quả pháp lý",)
+            def _is_consequence_src(item: RetrievedProvision) -> bool:
+                h = (item.article_heading or item.provision.heading or "").lower()
+                return any(kw in h for kw in _hq_kw)
+            paired = list(zip(sources, retrieved))
+            paired.sort(key=lambda p: (0 if _is_consequence_src(p[1]) else 1))
+            sources = [s for s, _ in paired]
+            logger.info(
+                "Answering: reordered sources for consequence question — "
+                "consequence provisions moved to front: %s",
+                [s["source_id"] for s, r in paired if _is_consequence_src(r)],
+            )
 
         system_prompt = (
             "Bạn là trợ lý tra cứu pháp luật Việt Nam. Chỉ dùng các nguồn được cung cấp; "
@@ -196,18 +257,30 @@ class GroundedAnswerService:
             "citation_ids phải là source_id ngắn từ nguồn (ví dụ S1), không được tự tạo mã khác. "
             "S1, S2 và mọi source_id chỉ được đặt trong trường citation_ids; tuyệt đối không viết chúng "
             "trong answer, claim text hoặc bất kỳ nội dung hiển thị cho người dùng. "
+            "TUYỆT ĐỐI không viết '[...]' hay '(...)' hay bất kỳ tiêu đề/nhãn nội bộ nào vào trường answer — "
+            "answer chỉ được chứa văn bản thuần trả lời câu hỏi cho người dùng đọc. "
             "Lịch sử hội thoại chỉ dùng để hiểu các từ tham chiếu như 'điều đó' hoặc 'trường hợp trên'; "
             "không phải căn cứ pháp lý và không được dùng để tạo kết luận nếu nguồn không hỗ trợ. "
             "QUAN TRỌNG — Quy tắc trả lời vs abstain:\n"
             "- NÊN trả lời khi: nguồn chứa đúng điều/khoản được hỏi, hoặc nội dung nguồn trực tiếp mô tả "
             "khái niệm/quy định mà câu hỏi đề cập. Trả lời bằng cách tóm tắt hoặc trích nội dung nguồn.\n"
-            "- PHẢI abstain=true khi: không có nguồn nào đề cập đến chủ thể câu hỏi, HOẶC câu hỏi hỏi "
-            "về HẬU QUẢ/XỬ LÝ mà không có nguồn nào quy định hậu quả đó. "
+            "- PHẢI abstain=true khi: (1) không có nguồn nào đề cập đến chủ thể câu hỏi; "
+            "(2) câu hỏi hỏi về HẬU QUẢ/XỬ LÝ mà không có nguồn nào quy định hậu quả đó; "
+            "(3) câu hỏi hỏi về pháp luật nước ngoài (Mỹ, EU, Nhật, Trung Quốc, v.v.) "
+            "trong khi tất cả các nguồn được cung cấp đều là pháp luật Việt Nam — "
+            "KHÔNG dùng nguồn Việt Nam để trả lời câu hỏi về pháp luật nước khác. "
             "Ví dụ cụ thể cần abstain: 'hậu quả khi vượt quá X' mà không có nguồn nào nói hậu quả; "
-            "'điều gì xảy ra khi vi phạm Y' mà chỉ có nguồn định nghĩa Y. "
+            "'điều gì xảy ra khi vi phạm Y' mà chỉ có nguồn định nghĩa Y; "
+            "'Luật Mỹ/EU quy định gì' khi tất cả nguồn là BLDS/luật Việt Nam. "
             "Không suy luận hậu quả từ định nghĩa. "
-            "Nếu nguồn có quy định trực tiếp, phải trả lời ngắn gọn từ nguồn đó. Chỉ tạo từ một đến ba claims "
-            "trực tiếp trả lời câu hỏi; không thêm định nghĩa, ngoại lệ hoặc chế tài không cần thiết. "
+            "Nếu nguồn có quy định trực tiếp, phải trả lời ngắn gọn từ nguồn đó. Tạo từ một đến ba claims "
+            "trực tiếp trả lời câu hỏi; không thêm định nghĩa hoặc ngoại lệ không liên quan đến câu hỏi. "
+            "ĐẶC BIỆT — Câu hỏi về quyền lợi/hậu quả ('được gì', 'có quyền gì', 'hậu quả là gì', 'xử lý thế nào'): "
+            "Provision có dạng '[Hậu quả pháp lý...] bên A phải bồi thường' trả lời trực tiếp cho 'bên B được gì' "
+            "(nghĩa vụ bồi thường của A = quyền được bồi thường của B). Không bỏ qua provision nào có heading "
+            "'Hậu quả pháp lý' và nội dung liên quan trực tiếp đến tình huống được hỏi. "
+            "Chỉ cite những provisions có nội dung LIÊN QUAN ĐẾN ĐÚNG CHỦ THỂ câu hỏi; "
+            "không cite provisions về trường hợp khác chỉ vì chúng có từ khóa tương tự. "
             "TUYỆT ĐỐI không lặp lại câu hỏi trong trường answer — answer phải bắt đầu ngay bằng nội dung trả lời. "
             "Khi nguồn có nhiều nhánh điều kiện phức tạp (VD: 'nếu A thì X; nếu B thì Y'), "
             "phải trích dẫn CHÍNH XÁC từng điều kiện và hậu quả tương ứng, không được hoán đổi hoặc nhầm lẫn giữa các nhánh. "
@@ -332,6 +405,8 @@ class GroundedAnswerService:
                 (perf_counter() - llm_started) * 1000, 0, token_budget_ms, map_reduce_ms,
             )
         llm_ms = (perf_counter() - llm_started) * 1000
+        # DEBUG: log raw LLM JSON để trace xem model chọn source nào
+        logger.info("LLM raw output (first 800 chars): %s", raw[:800])
         validation_started = perf_counter()
         answer = validate_model_answer(raw, retrieved, as_of, question)
         if answer.status == "abstained":
@@ -343,4 +418,36 @@ class GroundedAnswerService:
         elif not claims_are_supported(answer, retrieved):
             logger.warning("Rejected LLM output: a claim is not supported by its cited excerpt")
             answer = extractive_fallback(retrieved, as_of, fallback_minimum_score)
+        else:
+            # ── Post-injection: "Hậu quả pháp lý" provisions bị LLM bỏ qua ──
+            # Small LLMs (≤3B) thường bỏ qua provisions ở giữa/cuối context kể
+            # cả khi đã reorder. Với câu hỏi về quyền lợi/hậu quả, tự động inject
+            # provisions có heading "Hậu quả pháp lý" chưa được cite vào claims.
+            _consequence_q = ("được gì", "có quyền gì", "hậu quả", "xử lý", "được bồi", "quyền lợi")
+            if answer.status == "grounded" and any(kw in question.lower() for kw in _consequence_q):
+                cited_prov_ids = {str(cid) for claim in answer.claims for cid in claim.citation_ids}
+                for item in retrieved:
+                    h = (item.article_heading or item.provision.heading or "").lower()
+                    if "hậu quả pháp lý" not in h:
+                        continue
+                    if str(item.provision.id) in cited_prov_ids:
+                        continue
+                    # Inject provision này vào đầu claims list
+                    new_citation = citation_from(item)
+                    new_claim = Claim(
+                        text=source_text(item),
+                        citation_ids=[item.provision.id],
+                    )
+                    answer = ChatResponse(
+                        status=answer.status,
+                        answer=answer.answer,
+                        claims=[new_claim, *answer.claims],
+                        citations=[new_citation, *answer.citations],
+                        warnings=answer.warnings,
+                        applied_as_of_date=answer.applied_as_of_date,
+                    )
+                    logger.info(
+                        "Post-inject: added uncited 'Hậu quả pháp lý' provision %s K%s to claims",
+                        item.provision.article_no, item.provision.clause_no,
+                    )
         return AnswerGeneration(answer, llm_ms, (perf_counter() - validation_started) * 1000, token_budget_ms, map_reduce_ms)
