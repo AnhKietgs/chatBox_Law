@@ -12,3 +12,7 @@ env/
 # GENESIS client project credentials — never commit.
 .agentbox/.project-auth
 .agentbox/
+
+# AI agent working files — không commit lên git
+.superpowers/
+docs/superpowers/
