@@ -48,7 +48,17 @@ class LatencyBreakdown(BaseModel):
     citation_validation_ms: float = 0
     token_budget_ms: float = 0
     map_reduce_ms: float = 0
+    web_search_ms: float = 0
     total_ms: float = 0
+
+
+class WebSource(BaseModel):
+    """Unverified result returned by the configured web-search provider."""
+
+    id: str
+    title: str
+    url: HttpUrl
+    snippet: str
 
 
 class ChatResponse(BaseModel):
@@ -57,6 +67,10 @@ class ChatResponse(BaseModel):
     claims: list[Claim] = []
     citations: list[Citation] = []
     warnings: list[str] = []
+    # `web_search` remains an abstention from the legal corpus: it is shown as
+    # supplementary, unverified information and never as a legal citation.
+    source_mode: Literal["rag", "web_search", "abstained"] = "abstained"
+    web_sources: list[WebSource] = []
     applied_as_of_date: date
     latency: LatencyBreakdown | None = None
     conversation_id: UUID | None = None

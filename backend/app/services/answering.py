@@ -107,6 +107,7 @@ def validate_model_answer(raw: str, retrieved: list[RetrievedProvision], as_of: 
     citations = [citation_from(available[source_id]) for source_id in cited_source_ids]
     return ChatResponse(
         status="grounded",
+        source_mode="rag",
         answer=remove_internal_source_labels(proposed.answer),
         claims=[Claim(text=claim.text, citation_ids=[available[source_id.upper()].provision.id for source_id in claim.citation_ids]) for claim in proposed.claims],
         citations=citations,
@@ -134,6 +135,7 @@ def extractive_fallback(retrieved: list[RetrievedProvision], as_of: date, minimu
     logger.info("Using citation-first fallback from %s (%s, score=%.3f)", citation.document_code, locator, item.score)
     return ChatResponse(
         status="grounded",
+        source_mode="rag",
         answer=f"Theo {citation.document_title}, {locator}: {item.provision.content}",
         claims=[Claim(text=item.provision.content, citation_ids=[item.provision.id])],
         citations=[citation],
@@ -460,6 +462,7 @@ class GroundedAnswerService:
                     )
                     answer = ChatResponse(
                         status=answer.status,
+                        source_mode=answer.source_mode,
                         answer=answer.answer,
                         claims=[new_claim, *answer.claims],
                         citations=[new_citation, *answer.citations],

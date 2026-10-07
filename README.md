@@ -58,6 +58,7 @@ Kết quả đúng phải dẫn **Điều 301 Luật Thương mại 2005** và h
 - Hybrid retrieval: BGE-M3 dense + sparse, RRF, bge-reranker-v2-m3.
 - Conversational RAG: lưu hội thoại, contextualize câu hỏi theo ngữ cảnh và phát hiện đổi chủ đề.
 - HyDE + MultiQuery có kiểm soát cho câu hỏi ngắn/mơ hồ; không tạo căn cứ pháp lý mới.
+- Web-search fallback có kiểm soát: luôn chạy Hybrid RAG trước; chỉ khi điểm rerank dưới ngưỡng mới gọi tool web và gắn nhãn "chưa xác minh".
 - Versioning theo thời điểm hiệu lực: lưu dữ liệu lịch sử để tra cứu tình huống quá khứ.
 - Admin ingest PDF/DOCX, Docling và OCR fallback, review trước khi publish.
 - Chống prompt injection trong nội dung tài liệu, JWT admin và rate limit Redis cho API công khai.
@@ -110,6 +111,28 @@ docker compose exec ollama ollama list
 # Chạy backend tests
 docker compose exec api pytest -q
 ```
+
+## Cắm web search của bạn
+
+Web search **không thay thế RAG**. Luồng thực thi là:
+
+```text
+User question → Hybrid RAG + rerank → score ≥ threshold: LLM trả lời từ căn cứ pháp lý
+                                      └→ score < threshold: Web tool → LLM tóm tắt web chưa xác minh
+```
+
+Trong `.env`, đặt endpoint/tool gateway của bạn:
+
+```env
+WEB_SEARCH_FALLBACK_ENABLED=true
+WEB_SEARCH_RAG_THRESHOLD=0.20
+WEB_SEARCH_API_URL=https://your-search-gateway.example/search
+WEB_SEARCH_API_KEY=your-secret-key
+```
+
+Điểm cắm provider nằm tại [`backend/app/services/web_search.py`](backend/app/services/web_search.py), hàm `_request_provider()`. Adapter mẫu gửi `POST` với `{"query":"...","limit":5}` và đọc `{"results":[{"title":"...","url":"...","snippet":"..."}]}`. Có thể thay hàm này để dùng Tavily, Brave, Bing, SerpAPI hoặc tool gateway của bạn; **không** đưa API key xuống React.
+
+Khi fallback được dùng, API vẫn trả `status="abstained"` cùng `source_mode="web_search"`: UI nói rõ không có căn cứ pháp lý trong kho, hiển thị phần tóm tắt qua LLM và các URL web chưa được xác minh. Nội dung web được XML-boundary, quét prompt injection và không được chuyển thành citation Điều/Khoản/Điểm.
 
 ## API chính
 

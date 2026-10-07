@@ -24,6 +24,7 @@ from ..services.query_augmentation import (
     needs_clarification,
 )
 from ..services.retrieval import LegalRetriever
+from ..services.web_search import WebSearchAnswerService, WebSearchService, should_use_web_fallback
 from ..models import ChatMessage, Conversation
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
@@ -175,6 +176,58 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         answer.conversation_id = save_turn(db, conversation, payload.question, answer.answer)
         answer.latency = LatencyBreakdown(total_ms=round((perf_counter() - started) * 1000, 1))
         return answer
+
+    # RAG is never skipped: only after hybrid recall + reranking has completed
+    # do we evaluate its absolute score for the optional web-search fallback.
+    # This avoids a "lazy RAG" path where a broad web result replaces a valid
+    # provision already present in the approved legal corpus.
+    top_rag_score = retrieval.provisions[0].score if retrieval.provisions else None
+    if should_use_web_fallback(
+        provision_count=len(retrieval.provisions),
+        top_score=top_rag_score,
+        threshold=settings.web_search_rag_threshold,
+    ):
+        logger.info(
+            "RAG score gate triggered web fallback: provisions=%d top_score=%s threshold=%.4f",
+            len(retrieval.provisions),
+            f"{top_rag_score:.4f}" if top_rag_score is not None else "none",
+            settings.web_search_rag_threshold,
+        )
+        web_result = await WebSearchService().search(contextualized.retrieval_query)
+        if web_result.sources:
+            web_summary, used_web_sources, web_llm_ms = await WebSearchAnswerService().generate(
+                payload.question,
+                web_result.sources,
+            )
+            if web_summary and used_web_sources:
+                answer = abstain(applied_date)
+                answer.source_mode = "web_search"
+                answer.answer = (
+                    "Tôi không có đủ thông tin để cung cấp câu trả lời có căn cứ pháp lý từ kho văn bản đã duyệt. "
+                    "Tuy nhiên, dưới đây là thông tin tôi tìm được trên web (chưa được xác minh):\n\n"
+                    f"{web_summary}"
+                )
+                answer.warnings = [
+                    "Kết quả dưới đây lấy từ web, chưa phải căn cứ pháp lý đã được quản trị viên duyệt.",
+                    "Hãy kiểm tra nguồn gốc hoặc bổ sung văn bản chính thức vào kho trước khi dùng cho quyết định pháp lý.",
+                ]
+                answer.web_sources = used_web_sources
+                answer.conversation_id = save_turn(db, conversation, payload.question, answer.answer)
+                answer.latency = LatencyBreakdown(
+                    contextualization_ms=round(contextualized.llm_ms, 1),
+                    query_augmentation_ms=round(augmentation.llm_ms, 1),
+                    retrieval_ms=round(retrieval.retrieval_ms, 1),
+                    rerank_ms=round(retrieval.rerank_ms, 1),
+                    web_search_ms=round(web_result.elapsed_ms, 1),
+                    llm_ms=round(web_llm_ms, 1),
+                    total_ms=round((perf_counter() - started) * 1000, 1),
+                )
+                logger.info(
+                    "Chat returned unverified web fallback: sources=%d total=%.1fms",
+                    len(used_web_sources), answer.latency.total_ms,
+                )
+                return answer
+        logger.info("Web fallback yielded no usable summary; continuing to safe RAG abstention path")
 
     generation = await GroundedAnswerService().generate(
         payload.question,

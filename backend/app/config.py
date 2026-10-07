@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     # nhưng chỉ tìm được BLDS định nghĩa thời hạn, score ~0.13).
     # Các case đúng thường ≥ 0.40; ngưỡng 0.20 là buffer an toàn.
     reranker_minimum_absolute_score: float = 0.20
+    # Web search is a strictly secondary path. Hybrid RAG always runs first;
+    # only an empty/low-score rerank result can activate this adapter.
+    web_search_fallback_enabled: bool = True
+    web_search_rag_threshold: float = Field(default=0.20, ge=0, le=1)
+    # Provider-agnostic HTTP gateway. Configure these in .env after choosing a
+    # search provider/tool; see services/web_search.py for the request contract.
+    web_search_api_url: str = ""
+    web_search_api_key: str = ""
+    web_search_provider: str = "generic"
+    web_search_timeout_seconds: float = Field(default=15, gt=0, le=60)
+    web_search_max_results: int = Field(default=5, ge=1, le=10)
     claim_support_threshold: float = 0.65
     extractive_fallback_threshold: float = 0.50
     index_batch_size: int = 32
