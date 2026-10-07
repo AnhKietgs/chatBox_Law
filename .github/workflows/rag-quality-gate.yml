@@ -1,0 +1,61 @@
+name: RAGAS quality gate
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    # Weekly regression check. GitHub may delay scheduled workflows under load.
+    - cron: "17 2 * * 1"
+  push:
+    branches: [main]
+
+jobs:
+  configuration:
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          EVAL_API_BASE_URL: ${{ secrets.EVAL_API_BASE_URL }}
+          EVAL_ADMIN_EMAIL: ${{ secrets.EVAL_ADMIN_EMAIL }}
+          EVAL_ADMIN_PASSWORD: ${{ secrets.EVAL_ADMIN_PASSWORD }}
+        run: |
+          if [ -n "$EVAL_API_BASE_URL" ] && [ -n "$EVAL_ADMIN_EMAIL" ] && [ -n "$EVAL_ADMIN_PASSWORD" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "RAGAS gate is not configured: add the staging URL and admin credentials as GitHub Actions secrets."
+          fi
+
+  ragas:
+    needs: configuration
+    if: needs.configuration.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install evaluator-only dependencies
+        run: pip install -r evaluation/requirements-ragas.txt
+      - name: Require 100 named, expert-approved cases
+        run: python evaluation/validate_golden.py evaluation/golden_questions.jsonl --required-count 100
+      - name: Run deterministic and RAGAS quality gates
+        env:
+          EVAL_API_BASE_URL: ${{ secrets.EVAL_API_BASE_URL }}
+          EVAL_ADMIN_EMAIL: ${{ secrets.EVAL_ADMIN_EMAIL }}
+          EVAL_ADMIN_PASSWORD: ${{ secrets.EVAL_ADMIN_PASSWORD }}
+          RAGAS_JUDGE_BASE_URL: ${{ secrets.RAGAS_JUDGE_BASE_URL }}
+          RAGAS_JUDGE_API_KEY: ${{ secrets.RAGAS_JUDGE_API_KEY }}
+          RAGAS_JUDGE_MODEL: ${{ vars.RAGAS_JUDGE_MODEL }}
+        run: |
+          python evaluation/run_benchmark.py evaluation/golden_questions.jsonl
+          python evaluation/run_ragas.py evaluation/golden_questions.jsonl --report evaluation/reports/ragas-ci.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ragas-report
+          path: evaluation/reports/
+          if-no-files-found: ignore

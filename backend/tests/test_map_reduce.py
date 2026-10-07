@@ -31,7 +31,7 @@ async def test_single_batch_no_reduce():
     async def fake_post(*args, **kwargs):
         nonlocal call_count
         call_count += 1
-        return _mock_response(f"Tóm tắt batch {call_count}")
+        return _mock_response(f"[S1] Tóm tắt batch {call_count}")
 
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=fake_post):
         result = await MapReduceSummarizer().summarize("hợp đồng lao động", sources, 1000)
@@ -46,9 +46,18 @@ async def test_single_batch_no_reduce():
 async def test_single_batch_result_contains_summary():
     sources = [_make_source("S1", "Điều 1 hợp đồng")]
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-        mock_post.return_value = _mock_response("Điều 1 quy định về hợp đồng.")
+        mock_post.return_value = _mock_response("[S1] Điều 1 quy định về hợp đồng.")
         result = await MapReduceSummarizer().summarize("câu hỏi", sources, 1000)
     assert "Điều 1" in result.merged_text
+
+
+@pytest.mark.asyncio
+async def test_summary_without_source_id_is_rejected_for_safe_fallback():
+    sources = [_make_source("S1", "Điều 1 hợp đồng")]
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = _mock_response("Điều 1 quy định về hợp đồng.")
+        result = await MapReduceSummarizer().summarize("câu hỏi", sources, 1000)
+    assert result.merged_text == ""
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +67,8 @@ async def test_single_batch_result_contains_summary():
 @pytest.mark.asyncio
 async def test_multi_batch_triggers_reduce():
     """3 sources lớn → 3 batches → 3 map calls + 1 reduce call = 4 tổng."""
-    # Mỗi source cần ~229 tokens (800 chars / 3.5), map_batch_token_limit=2000
+    # Conservative Vietnamese estimator makes every 600-char source exceed
+    # the intentionally tiny batch limit below.
     # → tất cả vừa 1 batch trừ khi budget nhỏ hơn.
     # Để force 3 batches, dùng text đủ lớn (600 chars ≈ 171 tokens mỗi source)
     # và patch settings.map_batch_token_limit=200
@@ -72,7 +82,7 @@ async def test_multi_batch_triggers_reduce():
         nonlocal call_count
         call_count += 1
         # Trả về summary ngắn cho map; trả về merged cho reduce
-        content = f"summary_{call_count}" if call_count <= 3 else "merged_final"
+        content = f"[S{call_count}] summary_{call_count}" if call_count <= 3 else "[S1] [S2] [S3] merged_final"
         return _mock_response(content)
 
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=fake_post), \
@@ -81,6 +91,7 @@ async def test_multi_batch_triggers_reduce():
         s.map_batch_token_limit = 200      # force mỗi source vào 1 batch riêng
         s.map_reduce_timeout_seconds = 30.0
         s.context_model_limit = 8192
+        s.context_budget_safety_margin = 0.85
         s.ollama_base_url = "http://localhost:11434"
         s.ollama_model = "test-model"
         mock_settings.return_value = s
@@ -101,7 +112,7 @@ async def test_multi_batch_no_reduce_when_summaries_fit():
     async def fake_post(*args, **kwargs):
         nonlocal call_count
         call_count += 1
-        return _mock_response("tóm ngắn")
+        return _mock_response("[S1] tóm ngắn")
 
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=fake_post), \
          patch("app.services.map_reduce.get_settings") as mock_settings:
@@ -109,6 +120,7 @@ async def test_multi_batch_no_reduce_when_summaries_fit():
         s.map_batch_token_limit = 50     # force 2 batches
         s.map_reduce_timeout_seconds = 30.0
         s.context_model_limit = 8192
+        s.context_budget_safety_margin = 0.85
         s.ollama_base_url = "http://localhost:11434"
         s.ollama_model = "test-model"
         mock_settings.return_value = s
@@ -159,3 +171,12 @@ def test_split_empty_sources():
     batches = MapReduceSummarizer()._split_into_batches([], 2000, tb)
     # empty input → 1 empty batch hoặc empty list — không raise
     assert isinstance(batches, list)
+
+
+def test_fit_to_budget_respects_conservative_lexical_estimate():
+    from app.services.token_budget import TokenBudget
+
+    tb = TokenBudget(8192, 0, 0)
+    # One-character words stress the lexical-item branch more than char count.
+    clipped = MapReduceSummarizer._fit_to_budget("[S1] " + "a " * 100, 10, tb)
+    assert tb.estimate(clipped) <= 10

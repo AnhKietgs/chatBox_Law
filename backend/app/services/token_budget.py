@@ -1,15 +1,9 @@
-"""Token budget: estimate token usage and fit sources into a prompt budget.
-
-Estimation uses ceil(len(text) / 3.5) — a conservative approximation that
-works for Vietnamese UTF-8 text (each accented character is 1 Unicode code
-point, but the BPE tokeniser used by most LLMs maps Vietnamese syllables to
-1-2 tokens, so dividing character count by 3.5 stays safely below the real
-token count and never under-estimates).
-"""
+"""Token budget: safely estimate Vietnamese tokens and fit prompt sources."""
 from __future__ import annotations
 
-import math
 import logging
+
+from .token_estimation import estimate_vietnamese_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +29,12 @@ class TokenBudget:
     def estimate(self, text: str) -> int:
         """Return a conservative token estimate for *text*.
 
-        Uses ceil(len / 3.5); always returns ≥ 1 for non-empty input.
+        Uses the shared Vietnamese lexical-item + character upper bound; always
+        returns ≥ 1 for non-empty input.
         """
         if not text:
             return 0
-        return max(1, math.ceil(len(text) / 3.5))
+        return estimate_vietnamese_tokens(text)
 
     def available(self, fixed_prompt_text: str) -> int:
         """Return tokens remaining after accounting for the fixed prompt parts.

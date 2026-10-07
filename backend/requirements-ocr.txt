@@ -2,3 +2,7 @@
 # resolver cross-product with document-parser dependencies.
 rapidocr-onnxruntime==1.4.4
 paddleocr==2.9.1
+# Lightweight PDF helpers: inspect native text per page and render only the
+# sparse/scanned pages before sending their PNG bytes to OCR.
+pypdf==5.3.1
+pypdfium2==4.30.1

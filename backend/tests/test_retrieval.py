@@ -14,6 +14,12 @@ from app.models import LegalDocument, LegalProvision, LegalVersion, VersionStatu
 from app.services import retrieval
 
 
+def test_retrieval_debug_is_enabled_by_default_in_development_and_disabled_in_production():
+    assert retrieval.retrieval_debug_enabled(SimpleNamespace(app_env="development", retrieval_debug_logs=None)) is True
+    assert retrieval.retrieval_debug_enabled(SimpleNamespace(app_env="production", retrieval_debug_logs=None)) is False
+    assert retrieval.retrieval_debug_enabled(SimpleNamespace(app_env="production", retrieval_debug_logs=True)) is True
+
+
 def candidate(article: str, content: str):
     document = LegalDocument(id=uuid4(), code="LTM-2005", title="Luật Thương mại 2005")
     version = LegalVersion(

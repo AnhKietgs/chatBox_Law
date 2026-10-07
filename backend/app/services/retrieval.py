@@ -11,11 +11,25 @@ from ..models import LegalProvision, LegalVersion, LegalDocument, VersionStatus
 from ..config import get_settings
 from ..versioning import is_effective
 from .query_expansion import expand_commercial_query
+from .query_augmentation import retrieval_domain_filters
 from .conversation import contextual_retrieval_query
+from .prompt_security import scan_document_content
 from .vector_store import HybridVectorStore
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def retrieval_debug_enabled(settings: object) -> bool:
+    """Respect explicit override; otherwise enable traces only outside prod.
+
+    Keeping this small adapter also lets focused unit tests use a lightweight
+    SimpleNamespace instead of constructing the full Pydantic settings object.
+    """
+    configured = getattr(settings, "retrieval_debug_logs", None)
+    if configured is not None:
+        return bool(configured)
+    return str(getattr(settings, "app_env", "development")).strip().lower() in {"development", "dev", "local", "test"}
 
 
 def score_percentile(scores: list[float], percentile: float) -> float:
@@ -52,7 +66,7 @@ class RetrievalResult:
 def log_top_k(stage: str, question: str, candidates: list[RetrievedProvision], score_label: str) -> None:
     """Development-only, human-readable retrieval trace for relevance debugging."""
     settings = get_settings()
-    if not getattr(settings, "retrieval_debug_logs", False):
+    if not retrieval_debug_enabled(settings):
         return
     top_k = max(1, getattr(settings, "retrieval_debug_top_k", 8))
     logger.info("Retrieval %s: query=%r, candidates=%d", stage, question[:500], len(candidates))
@@ -99,7 +113,10 @@ class LegalRetriever:
         # bounded-history composition only as a resilient compatibility fallback.
         retrieval_query = standalone_query or contextual_retrieval_query(question, conversation_context)
         expanded = expand_commercial_query(retrieval_query)
-        if expanded.applied and settings.retrieval_debug_logs:
+        domains = retrieval_domain_filters(retrieval_query)
+        if domains:
+            logger.info("Retrieval metadata filter: domains=%s", domains)
+        if expanded.applied and retrieval_debug_enabled(settings):
             logger.info("Retrieval query expansion: original=%r expanded=%r", expanded.original, expanded.retrieval_query)
         points = HybridVectorStore().search(
             retrieval_query,
@@ -108,6 +125,7 @@ class LegalRetriever:
             expansion_query=expanded.retrieval_query if expanded.applied else None,
             additional_queries=additional_queries,
             hyde_query=hyde_query,
+            domains=domains or None,
         )
         ids = [UUID(str(point.id)) for point in points]
         scores = {UUID(str(point.id)): float(point.score) for point in points}
@@ -143,17 +161,26 @@ class LegalRetriever:
         else:
             article_headings_db = {}
 
-        valid = [
-            RetrievedProvision(
+        valid: list[RetrievedProvision] = []
+        blocked_legacy_count = 0
+        for provision, version, document in rows:
+            if not is_effective(version.effective_from, version.effective_to, as_of):
+                continue
+            # Defence for data published before the ingest scanner existed.
+            # It fails closed per provision, so a single suspicious chunk never
+            # reaches the reranker or answer-model context.
+            if scan_document_content(f"{provision.heading or ''}\n{provision.content}"):
+                blocked_legacy_count += 1
+                continue
+            valid.append(RetrievedProvision(
                 provision=provision,
                 version=version,
                 document=document,
                 score=scores[provision.id],
                 article_heading=article_headings_db.get((str(provision.version_id), provision.article_no)),
-            )
-            for provision, version, document in rows
-            if is_effective(version.effective_from, version.effective_to, as_of)
-        ]
+            ))
+        if blocked_legacy_count:
+            logger.warning("Retrieval security filter excluded %d suspicious legacy provision(s)", blocked_legacy_count)
         log_top_k("hybrid-recall", question, valid, "rrf_score")
         retrieval_ms = (perf_counter() - retrieval_started) * 1000
         # bge-reranker-v2-m3 is deliberately applied after hybrid recall.

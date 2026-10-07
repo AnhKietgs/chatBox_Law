@@ -84,7 +84,7 @@ async def contextualize_for_retrieval(question: str, conversation_context: str) 
                     "format": ReformulatedQuestion.model_json_schema(),
                     "think": False,
                     "keep_alive": "30m",
-                    "options": {"temperature": 0, "num_predict": 160},
+                    "options": {"temperature": settings.llm_temperature, "num_predict": 160},
                 },
             )
             response.raise_for_status()

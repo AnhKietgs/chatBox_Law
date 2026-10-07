@@ -5,7 +5,6 @@ most likely to surface runtime errors that unit tests miss.
 """
 from __future__ import annotations
 
-import math
 import pytest
 from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,16 +13,13 @@ from app.services.token_budget import TokenBudget
 
 
 # ---------------------------------------------------------------------------
-# Review Focus 1: estimate() conservative for Vietnamese multi-byte chars
+# Review Focus 1: estimate() conservative for Vietnamese BPE tokenization
 # ---------------------------------------------------------------------------
 
 def test_estimate_conservative_for_vietnamese():
     """
-    len(text) counts Unicode code points, not bytes.
-    ceil(len / 3.5) is always ≥ 1 for non-empty Vietnamese text.
-    Since Vietnamese BPE tokens ≈ 1 char each, dividing by 3.5 gives a
-    value well below the real token count — safely under-estimates budget
-    usage, never over-claims space.
+    Vietnamese is mostly monosyllabic. Reserve two BPE tokens per lexical
+    item and compare with the character estimate, then keep the larger bound.
     """
     tb = TokenBudget(8192, 1024, 256)
     samples = [
@@ -34,13 +30,13 @@ def test_estimate_conservative_for_vietnamese():
     for text in samples:
         est = tb.estimate(text)
         assert est >= 1, f"estimate({text!r}) returned {est}"
-        assert est == math.ceil(len(text) / 3.5)
+        assert est >= len(text.split()) * 2
 
 
 def test_estimate_never_zero_for_single_char():
     tb = TokenBudget(8192, 1024, 256)
-    assert tb.estimate("x") == 1
-    assert tb.estimate("ơ") == 1  # Vietnamese accented character
+    assert tb.estimate("x") == 2
+    assert tb.estimate("ơ") == 2  # one Vietnamese lexical item reserves two tokens
 
 
 # ---------------------------------------------------------------------------
@@ -149,11 +145,12 @@ def test_new_settings_have_correct_defaults():
     get_settings.cache_clear()
     s = get_settings()
     assert s.context_model_limit == 8192
+    assert s.context_budget_safety_margin == 0.85
     assert s.context_reserved_output == 1024
     assert s.context_overhead == 256
     assert s.retrieval_recall_pool == 30
     assert s.retrieval_inject_limit == 7
-    assert s.map_reduce_enabled is False
+    assert s.map_reduce_enabled is True
     assert s.map_batch_token_limit == 2000
     assert s.map_reduce_timeout_seconds == 60.0
     assert s.history_window_turns == 5

@@ -2,33 +2,181 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
+import random
 from datetime import timedelta
 from uuid import UUID
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..models import IngestionJob, JobStatus, LegalProvision, LegalVersion, VersionStatus
-from .legal_parser import parse_legal_text
+from .legal_parser import ParsedProvision, estimate_tokens, parse_legal_text
+from .prompt_security import scan_document_content
 from .storage import ObjectStorage
 from .vector_store import HybridVectorStore
 
 logger = logging.getLogger(__name__)
+PDF_PAGE_TEXT_THRESHOLD = 100
 
 
-def extract_with_docling(source: bytes, filename: str) -> str:
-    """Extract text with Docling; OCR engines are only used when Docling has no text."""
+def _legal_locator(provision: ParsedProvision) -> str:
+    locator = f"Điều {provision.article_no}"
+    if provision.clause_no:
+        locator += f", Khoản {provision.clause_no}"
+    if provision.point_label:
+        locator += f", Điểm {provision.point_label}"
+    return locator
+
+
+def log_chunk_audit(version_id: UUID, provisions: list[ParsedProvision]) -> None:
+    """Emit reproducible, compact ingest diagnostics for human review."""
+    if not provisions:
+        logger.warning("Chunk audit: version_id=%s has no chunks", version_id)
+        return
+    settings = get_settings()
+    estimates = sorted(estimate_tokens(item.content) for item in provisions)
+    p50 = estimates[(len(estimates) - 1) // 2]
+    p95 = estimates[math.ceil(len(estimates) * 0.95) - 1]
+    oversized = sum(score > settings.chunk_max_tokens for score in estimates)
+    split_chunks = sum(item.chunk_index > 1 for item in provisions)
+    logger.info(
+        "Chunk audit: version_id=%s chunks=%d token_estimate[min=%d p50=%d p95=%d max=%d] "
+        "split_chunks=%d over_limit=%d policy=structure-aware; overlap=%d only-for-split-parts",
+        version_id, len(provisions), estimates[0], p50, p95, estimates[-1], split_chunks, oversized,
+        settings.chunk_split_overlap_tokens,
+    )
+    sample_size = min(settings.chunk_audit_sample_size, len(provisions))
+    if not sample_size:
+        return
+    # A version-id seed makes an audit reproducible instead of log-noisy.
+    sample_indexes = sorted(random.Random(str(version_id)).sample(range(len(provisions)), sample_size))
+    for sample_number, index in enumerate(sample_indexes, start=1):
+        item = provisions[index]
+        excerpt = " ".join(item.content.split())[:200]
+        logger.info(
+            "Chunk audit sample %d/%d: ordinal=%d locator=%s part=%d tokens=%d excerpt=%r",
+            sample_number, sample_size, item.ordinal, _legal_locator(item), item.chunk_index,
+            estimate_tokens(item.content), excerpt,
+        )
+
+
+def _extract_docling_document(source: bytes, filename: str) -> str:
+    """Return Docling Markdown for one document or one temporary PDF page."""
     from docling.document_converter import DocumentConverter
     import tempfile
     from pathlib import Path
+
     suffix = Path(filename).suffix or ".pdf"
     with tempfile.NamedTemporaryFile(suffix=suffix) as temporary:
         temporary.write(source)
         temporary.flush()
         result = DocumentConverter().convert(temporary.name)
-        markdown = result.document.export_to_markdown()
+        return result.document.export_to_markdown()
+
+
+def _read_pdf_page_texts(source: bytes) -> list[str]:
+    """Inspect the embedded text for every PDF page without running OCR."""
+    from io import BytesIO
+    from pypdf import PdfReader
+
+    reader = PdfReader(BytesIO(source))
+    return [(page.extract_text() or "").strip() for page in reader.pages]
+
+
+def _render_pdf_page_png(source: bytes, page_index: int) -> bytes:
+    """Render one PDF page into a readable PNG for RapidOCR/PaddleOCR."""
+    from io import BytesIO
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(source)
+    try:
+        page = document[page_index]
+        try:
+            bitmap = page.render(scale=2.0)
+            image = bitmap.to_pil()
+            try:
+                output = BytesIO()
+                image.save(output, format="PNG")
+                return output.getvalue()
+            finally:
+                image.close()
+        finally:
+            page.close()
+    finally:
+        document.close()
+
+
+def _extract_hybrid_pdf(source: bytes, filename: str) -> str | None:
+    """Extract PDF page-by-page only when at least one page needs OCR.
+
+    A whole-document character threshold loses scanned pages in a hybrid PDF:
+    the text on ordinary pages makes the total look healthy.  Instead, inspect
+    each page; pages below the threshold are rendered and OCRed while text
+    pages retain their native extraction.  ``None`` means no sparse page was
+    found and callers should use the higher-fidelity full Docling conversion.
+    """
+    try:
+        page_texts = _read_pdf_page_texts(source)
+    except Exception as exc:
+        logger.warning("PDF page inspection failed for %s; using full Docling: %s", filename, exc)
+        return None
+
+    sparse_indexes = [index for index, text in enumerate(page_texts) if len(text) < PDF_PAGE_TEXT_THRESHOLD]
+    logger.info(
+        "PDF page text inspection: filename=%s pages=%d chars_per_page=%s sparse_pages=%s threshold=%d",
+        filename,
+        len(page_texts),
+        [len(text) for text in page_texts],
+        [index + 1 for index in sparse_indexes],
+        PDF_PAGE_TEXT_THRESHOLD,
+    )
+    if not sparse_indexes:
+        return None
+
+    merged_pages = list(page_texts)
+    for page_index in sparse_indexes:
+        page_no = page_index + 1
+        try:
+            ocr_text = extract_with_ocr(_render_pdf_page_png(source, page_index)).strip()
+        except Exception as exc:
+            # Preserve any short embedded text instead of silently deleting a
+            # page when both OCR engines fail. The reviewer can reject it.
+            logger.warning("OCR failed for %s page=%d: %s", filename, page_no, exc)
+            ocr_text = ""
+        if ocr_text:
+            merged_pages[page_index] = ocr_text
+        logger.info(
+            "PDF page loaded: filename=%s page=%d native_len=%d ocr_len=%d final_len=%d",
+            filename,
+            page_no,
+            len(page_texts[page_index]),
+            len(ocr_text),
+            len(merged_pages[page_index]),
+        )
+
+    text = "\n\n".join(page for page in merged_pages if page.strip())
+    logger.info("Hybrid PDF load complete: filename=%s len(text)=%d ocr_pages=%s", filename, len(text), [index + 1 for index in sparse_indexes])
+    return text
+
+
+def extract_with_docling(source: bytes, filename: str) -> str:
+    """Extract text while OCRing only sparse pages of a hybrid PDF."""
+    from pathlib import Path
+
+    if Path(filename).suffix.lower() == ".pdf":
+        hybrid_text = _extract_hybrid_pdf(source, filename)
+        if hybrid_text is not None:
+            logger.info("Document load complete: filename=%s len(text)=%d source=hybrid_pdf", filename, len(hybrid_text))
+            if hybrid_text.strip():
+                return hybrid_text
+
+    markdown = _extract_docling_document(source, filename)
+    logger.info("Document load complete: filename=%s len(text)=%d source=docling", filename, len(markdown))
     if markdown.strip():
         return markdown
-    return extract_with_ocr(source)
+    text = extract_with_ocr(source)
+    logger.info("Document load complete: filename=%s len(text)=%d source=ocr_fallback", filename, len(text))
+    return text
 
 
 def extract_with_ocr(source: bytes) -> str:
@@ -68,10 +216,26 @@ def process_version(db: Session, job_id: UUID, filename: str) -> None:
         source = storage.get(version.source_object_key)
         version.checksum = hashlib.sha256(source).hexdigest()
         text = extract_with_docling(source, filename)
-        provisions = parse_legal_text(text)
+        logger.info("Ingestion text loaded: version_id=%s filename=%s len(text)=%d", version.id, filename, len(text))
+        findings = scan_document_content(text)
+        if findings:
+            rule_ids = ", ".join(finding.rule_id for finding in findings)
+            logger.warning(
+                "Document security scan quarantined version_id=%s filename=%s rules=%s",
+                version.id, filename, rule_ids,
+            )
+            # Do not persist parsed text or create Qdrant vectors. The original
+            # file remains in restricted object storage for the admin audit.
+            raise ValueError(
+                "Tệp bị cách ly do có dấu hiệu prompt injection "
+                f"({rule_ids}); không được lập chỉ mục."
+            )
+        settings = get_settings()
+        provisions = parse_legal_text(text, settings.chunk_max_tokens, settings.chunk_split_overlap_tokens)
+        log_chunk_audit(version.id, provisions)
         job.progress, job.message = 45, f"Đã nhận diện {len(provisions)} đơn vị Điều/Khoản/Điểm"
         db.execute(delete(LegalProvision).where(LegalProvision.version_id == version.id))
-        rows = [LegalProvision(version_id=version.id, article_no=p.article_no, clause_no=p.clause_no, point_label=p.point_label, heading=p.heading, content=p.content, ordinal=p.ordinal) for p in provisions]
+        rows = [LegalProvision(version_id=version.id, article_no=p.article_no, clause_no=p.clause_no, point_label=p.point_label, heading=p.heading, content=p.content, ordinal=p.ordinal, chunk_index=p.chunk_index) for p in provisions]
         db.add_all(rows)
         parsed_key = f"parsed/{version.id}.json"
         storage.put(parsed_key, json.dumps([p.__dict__ for p in provisions], ensure_ascii=False).encode(), "application/json")
@@ -95,8 +259,18 @@ def _build_embedding_records(version: LegalVersion) -> list[tuple[UUID, str, dic
     ngữ cảnh được thực hiện ở tầng reranker (retrieval.py) nơi nó không ảnh
     hưởng đến recall. Dùng chung cho publish_version() và reindex_version().
     """
+    findings = scan_document_content("\n".join(
+        f"{provision.heading or ''}\n{provision.content}" for provision in version.provisions
+    ))
+    if findings:
+        rule_ids = ", ".join(finding.rule_id for finding in findings)
+        logger.warning("Blocked Qdrant indexing for version_id=%s rules=%s", version.id, rule_ids)
+        raise ValueError(f"Không thể index: phát hiện dấu hiệu prompt injection ({rule_ids})")
     payload_base = {
         "version_id": str(version.id),
+        "document_code": version.document.code,
+        "domain": version.document.domain,
+        "category": version.document.category,
         "status": "PUBLISHED",
         "effective_from": version.effective_from.isoformat(),
         "effective_to": version.effective_to.isoformat() if version.effective_to else None,
@@ -104,7 +278,7 @@ def _build_embedding_records(version: LegalVersion) -> list[tuple[UUID, str, dic
     records: list[tuple[UUID, str, dict]] = []
     for provision in version.provisions:
         text = f"Điều {provision.article_no}. {provision.heading or ''}\n{provision.content}"
-        records.append((provision.id, text, payload_base))
+        records.append((provision.id, text, {**payload_base, "chunk_index": provision.chunk_index}))
     return records
 
 

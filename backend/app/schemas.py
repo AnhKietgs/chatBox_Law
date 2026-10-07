@@ -62,6 +62,14 @@ class ChatResponse(BaseModel):
     conversation_id: UUID | None = None
 
 
+class EvaluationTrace(BaseModel):
+    """Admin-only RAG evaluation trace; never returned by the public chat API."""
+
+    answer: ChatResponse
+    retrieved_contexts: list[str]
+    retrieved_locators: list[str]
+
+
 class VersionSummary(BaseModel):
     id: UUID
     document_code: str
@@ -71,6 +79,8 @@ class VersionSummary(BaseModel):
     effective_to: date | None
     status: str
     official_url: str
+    domain: str
+    category: str
 
 
 class ProvisionSummary(BaseModel):
@@ -81,6 +91,7 @@ class ProvisionSummary(BaseModel):
     heading: str | None
     content: str
     ordinal: int
+    chunk_index: int = 1
 
 
 class ProvisionPage(BaseModel):

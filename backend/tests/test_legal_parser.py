@@ -1,4 +1,4 @@
-from app.services.legal_parser import parse_legal_text
+from app.services.legal_parser import estimate_tokens, parse_legal_text
 
 
 def test_parser_preserves_article_clause_and_point():
@@ -42,3 +42,23 @@ Mức phạt không quá 8% giá trị phần nghĩa vụ hợp đồng bị vi 
     ]
     article_300 = "\n".join(p.content for p in provisions if p.article_no == "300")
     assert "Điều 301" not in article_300
+
+
+def test_parser_splits_only_an_oversized_legal_unit_with_limited_overlap():
+    sentence = "Bên vi phạm phải thực hiện nghĩa vụ theo đúng thỏa thuận của hợp đồng. "
+    text = f"Điều 300. Phạt vi phạm\n1. {sentence * 18}"
+
+    provisions = parse_legal_text(text, chunk_max_tokens=35, chunk_split_overlap_tokens=5)
+
+    assert len(provisions) > 1
+    assert [(item.article_no, item.clause_no, item.point_label) for item in provisions] == [("300", "1", None)] * len(provisions)
+    assert [item.chunk_index for item in provisions] == list(range(1, len(provisions) + 1))
+    assert all(item.content for item in provisions)
+    assert all(estimate_tokens(item.content) <= 35 for item in provisions)
+
+
+def test_parser_and_prompt_budget_share_conservative_vietnamese_estimator():
+    from app.services.token_budget import TokenBudget
+
+    text = "Điều khoản hợp đồng thương mại được thực hiện theo thỏa thuận."
+    assert estimate_tokens(text) == TokenBudget(8192, 0, 0).estimate(text)

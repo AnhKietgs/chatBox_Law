@@ -1,0 +1,5 @@
+# Kept outside backend runtime dependencies. Install only in the evaluator/CI job.
+# Ragas 0.4 uses the direct metric.ascore() API used by run_ragas.py.
+ragas>=0.4,<0.5
+openai>=1.0,<2.0
+httpx==0.28.1

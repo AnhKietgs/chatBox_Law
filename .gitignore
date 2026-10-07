@@ -12,6 +12,10 @@ env/
 # GENESIS client project credentials — never commit.
 .agentbox/.project-auth
 .agentbox/
+.agents/
+
+# Generated evaluation reports may contain model output; never version them.
+evaluation/reports/
 
 # AI agent working files — không commit lên git
 .superpowers/

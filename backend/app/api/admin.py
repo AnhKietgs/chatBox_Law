@@ -3,25 +3,45 @@ import hashlib
 from pathlib import Path
 from uuid import UUID, uuid4
 from urllib.parse import urlparse
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from ..celery_app import celery
 from ..config import get_settings
 from ..database import get_db
 from ..models import IngestionJob, JobStatus, LegalDocument, LegalProvision, LegalVersion, VersionStatus
-from ..schemas import JobSummary, ProvisionPage, ProvisionSummary, PublishRequest, ReviewSummary, TokenRequest, TokenResponse, VersionSummary
+from ..schemas import ChatQuery, EvaluationTrace, JobSummary, ProvisionPage, ProvisionSummary, PublishRequest, ReviewSummary, TokenRequest, TokenResponse, VersionSummary
 from ..security import issue_token, require_admin
 from ..services.ingestion import publish_version, reindex_version
 from ..services.storage import ObjectStorage
 from ..services.vector_store import HybridVectorStore
+from ..services.document_metadata import normalize_category, normalize_domain
+from ..services.answering import GroundedAnswerService, abstain
+from ..services.query_augmentation import augment_for_retrieval, detect_mixed_legal_domains
+from ..services.retrieval import LegalRetriever
+from ..services.prompt_security import scan_document_content
+from ..rate_limit import enforce_admin_login_rate_limit
 from ..versioning import windows_overlap
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
 
 
+def evaluation_context(item: object) -> tuple[str, str]:
+    """Format the exact provision supplied by retrieval for evaluator audit."""
+    provision = item.provision
+    document = item.document
+    version = item.version
+    locator = (
+        f"{document.code} | {version.version_label} | Điều {provision.article_no}"
+        f", Khoản {provision.clause_no or '-'}, Điểm {provision.point_label or '-'}"
+    )
+    heading = item.article_heading or provision.heading
+    text = f"{locator}\n{heading + chr(10) if heading else ''}{provision.content}"
+    return text, locator
+
+
 def provision_summary(row: LegalProvision) -> ProvisionSummary:
-    return ProvisionSummary(id=row.id, article_no=row.article_no, clause_no=row.clause_no, point_label=row.point_label, heading=row.heading, content=row.content, ordinal=row.ordinal)
+    return ProvisionSummary(id=row.id, article_no=row.article_no, clause_no=row.clause_no, point_label=row.point_label, heading=row.heading, content=row.content, ordinal=row.ordinal, chunk_index=row.chunk_index)
 
 
 def structure_hash(rows: list[LegalProvision]) -> str:
@@ -34,19 +54,68 @@ def structure_hash(rows: list[LegalProvision]) -> str:
 
 
 @router.post("/token", response_model=TokenResponse)
-def login(payload: TokenRequest) -> TokenResponse:
+def login(payload: TokenRequest, request: Request) -> TokenResponse:
+    enforce_admin_login_rate_limit(request)
     settings = get_settings()
     if payload.email != settings.admin_email or payload.password != settings.admin_password:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sai thông tin quản trị viên")
     return TokenResponse(access_token=issue_token(payload.email))
 
 
+@router.post("/evaluation/query", response_model=EvaluationTrace)
+async def evaluation_query(
+    payload: ChatQuery,
+    _: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> EvaluationTrace:
+    """Run production RAG with the complete reranked context for RAGAS.
+
+    This endpoint requires the admin JWT. Public chat exposes only citations
+    included in an answer, while an evaluator needs every provision that was
+    actually supplied to the answer model in order to score retrieval quality.
+    """
+    applied_date = payload.as_of_date or date.today()
+    mixed_domains = detect_mixed_legal_domains(payload.question)
+    if mixed_domains.is_mixed:
+        answer = abstain(applied_date)
+        answer.answer = "Câu hỏi đa lĩnh vực cần được tách trước khi đánh giá."
+        return EvaluationTrace(answer=answer, retrieved_contexts=[], retrieved_locators=[])
+    augmentation = await augment_for_retrieval(payload.question)
+    retrieval = LegalRetriever(db).retrieve_with_metrics(
+        payload.question,
+        applied_date,
+        inject_limit=get_settings().retrieval_inject_limit,
+        standalone_query=payload.question,
+        additional_queries=augmentation.query_variants,
+        hyde_query=augmentation.hypothetical_document,
+    )
+    generation = await GroundedAnswerService().generate(
+        payload.question,
+        retrieval.provisions,
+        applied_date,
+        fallback_minimum_score=retrieval.minimum_score,
+        retrieval_query=payload.question,
+    )
+    contexts_and_locators = [evaluation_context(item) for item in retrieval.provisions]
+    return EvaluationTrace(
+        answer=generation.answer,
+        retrieved_contexts=[text for text, _ in contexts_and_locators],
+        retrieved_locators=[locator for _, locator in contexts_and_locators],
+    )
+
+
 @router.post("/versions", response_model=JobSummary, status_code=status.HTTP_202_ACCEPTED)
 def upload_version(
     document_code: str = Form(...), title: str = Form(...), version_label: str = Form(...), official_url: str = Form(...),
-    effective_from: date = Form(...), effective_to: str | None = Form(None), file: UploadFile = File(...),
+    effective_from: date = Form(...), effective_to: str | None = Form(None),
+    domain: str = Form("general"), category: str = Form("general"), file: UploadFile = File(...),
     _: str = Depends(require_admin), db: Session = Depends(get_db),
 ) -> JobSummary:
+    try:
+        normalized_domain = normalize_domain(domain)
+        normalized_category = normalize_category(category)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".pdf", ".docx"}:
         raise HTTPException(status_code=422, detail="Chỉ chấp nhận PDF hoặc DOCX")
@@ -62,12 +131,16 @@ def upload_version(
     if parsed_url.scheme != "https" or not parsed_url.netloc:
         raise HTTPException(status_code=422, detail="URL nguồn chính thức phải dùng HTTPS hợp lệ")
     existing = db.scalar(select(LegalDocument).where(LegalDocument.code == document_code))
-    document = existing or LegalDocument(code=document_code, title=title)
+    document = existing or LegalDocument(
+        code=document_code, title=title, domain=normalized_domain, category=normalized_category,
+    )
     if not existing:
         db.add(document)
         db.flush()
     else:
         document.title = title
+        document.domain = normalized_domain
+        document.category = normalized_category
     existing_versions = db.scalars(select(LegalVersion).where(LegalVersion.document_id == document.id, LegalVersion.status == VersionStatus.published)).all()
     invalid_overlap = any(
         windows_overlap(effective_from, parsed_effective_to, version.effective_from, version.effective_to)
@@ -79,6 +152,15 @@ def upload_version(
     content = file.file.read()
     if not content or len(content) > 50 * 1024 * 1024:
         raise HTTPException(status_code=422, detail="Tệp rỗng hoặc vượt quá 50 MB")
+    # Fast path for visible/plain document content. The worker repeats the
+    # scan after Docling/OCR so compressed PDF/DOCX text cannot bypass it.
+    raw_findings = scan_document_content(content.decode("utf-8", errors="ignore"))
+    if raw_findings:
+        rule_ids = ", ".join(finding.rule_id for finding in raw_findings)
+        raise HTTPException(
+            status_code=422,
+            detail=f"Tệp bị từ chối do có dấu hiệu prompt injection ({rule_ids}).",
+        )
     existing_version = db.scalar(select(LegalVersion).where(
         LegalVersion.document_id == document.id,
         LegalVersion.version_label == version_label,
@@ -123,7 +205,7 @@ def get_job(job_id: UUID, _: str = Depends(require_admin), db: Session = Depends
 @router.get("/versions", response_model=list[VersionSummary])
 def list_versions(_: str = Depends(require_admin), db: Session = Depends(get_db)) -> list[VersionSummary]:
     rows = db.execute(select(LegalVersion, LegalDocument).join(LegalDocument).order_by(LegalVersion.created_at.desc())).all()
-    return [VersionSummary(id=v.id, document_code=d.code, document_title=d.title, version_label=v.version_label, effective_from=v.effective_from, effective_to=v.effective_to, status=v.status.value, official_url=v.official_url) for v, d in rows]
+    return [VersionSummary(id=v.id, document_code=d.code, document_title=d.title, version_label=v.version_label, effective_from=v.effective_from, effective_to=v.effective_to, status=v.status.value, official_url=v.official_url, domain=d.domain, category=d.category) for v, d in rows]
 
 
 @router.get("/versions/{version_id}/provisions", response_model=list[ProvisionSummary])

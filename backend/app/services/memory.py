@@ -84,7 +84,7 @@ async def summarize_history(
                     "stream": False,
                     "think": False,
                     "keep_alive": "30m",
-                    "options": {"temperature": 0, "num_predict": 200},
+                    "options": {"temperature": settings.llm_temperature, "num_predict": 200},
                 },
             )
             response.raise_for_status()

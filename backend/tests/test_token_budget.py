@@ -1,9 +1,9 @@
 """Tests for TokenBudget — token estimation and source fitting."""
 from __future__ import annotations
 
-import math
 import pytest
 from app.services.token_budget import TokenBudget
+from app.services.token_estimation import estimate_vietnamese_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -13,13 +13,14 @@ from app.services.token_budget import TokenBudget
 def test_estimate_ascii():
     tb = TokenBudget(8192, 1024, 256)
     text = "a" * 350
-    assert tb.estimate(text) == math.ceil(350 / 3.5)  # == 100
+    # One long identifier is covered by the character bound: ceil(350 / 2.5).
+    assert tb.estimate(text) == 140
 
 
 def test_estimate_vietnamese():
     tb = TokenBudget(8192, 1024, 256)
-    # "điều" = 4 ký tự Unicode
-    assert tb.estimate("điều") == math.ceil(4 / 3.5)  # == 2
+    # One Vietnamese lexical item reserves two BPE tokens.
+    assert tb.estimate("điều") == 2
 
 
 def test_estimate_never_zero_for_nonempty():
@@ -32,17 +33,13 @@ def test_estimate_empty_returns_zero():
     assert tb.estimate("") == 0
 
 
-def test_estimate_conservative_for_vietnamese():
-    """estimate() với text tiếng Việt phải ≥ 1 và > 0.
-
-    len/3.5 < real byte count → bảo thủ, không bao giờ under-estimate
-    theo mô hình tính token bằng bytes.
-    """
+def test_estimate_reserves_two_tokens_per_vietnamese_syllable():
     tb = TokenBudget(8192, 1024, 256)
     text = "Điều khoản hợp đồng lao động theo Bộ luật Lao động."
-    est = tb.estimate(text)
-    assert est >= 1
-    assert est > 0
+    # 10 lexical items x 2 tokens. This is materially more conservative than
+    # the former ceil(len/3.5) estimate for Vietnamese.
+    assert tb.estimate(text) >= 20
+    assert tb.estimate(text) == estimate_vietnamese_tokens(text)
 
 
 # ---------------------------------------------------------------------------

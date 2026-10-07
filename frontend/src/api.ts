@@ -4,7 +4,7 @@ const jsonHeaders = { 'Content-Type': 'application/json' }
 type ValidationIssue = { loc?: Array<string | number>; msg?: string }
 const fieldNames: Record<string, string> = {
   document_code: 'Mã văn bản', title: 'Tên văn bản', version_label: 'Nhãn phiên bản',
-  official_url: 'URL chính thức', effective_from: 'Hiệu lực từ', effective_to: 'Hiệu lực đến', file: 'Tệp PDF/DOCX',
+  official_url: 'URL chính thức', effective_from: 'Hiệu lực từ', effective_to: 'Hiệu lực đến', domain: 'Lĩnh vực', category: 'Nhóm nghiệp vụ', file: 'Tệp PDF/DOCX',
 }
 
 async function responseError(response: Response, fallback: string): Promise<Error> {
@@ -70,6 +70,10 @@ export async function publishedChunks(token: string, id: string, offset = 0, lim
 export async function publish(token: string, id: string, reviewedStructureHash: string) {
   const response = await fetch(`/api/v1/admin/versions/${id}/publish`, { method: 'POST', headers: { ...jsonHeaders, Authorization: `Bearer ${token}` }, body: JSON.stringify({ reviewed_structure_hash: reviewedStructureHash }) })
   if (!response.ok) throw await responseError(response, 'Không thể xuất bản')
+}
+export async function reindex(token: string, id: string) {
+  const response = await fetch(`/api/v1/admin/versions/${id}/reindex`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } })
+  if (!response.ok) throw await responseError(response, 'Không thể lập chỉ mục lại')
 }
 export async function withdraw(token: string, id: string) {
   const response = await fetch(`/api/v1/admin/versions/${id}/withdraw`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } })

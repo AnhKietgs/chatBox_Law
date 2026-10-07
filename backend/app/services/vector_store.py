@@ -88,6 +88,7 @@ class HybridVectorStore:
         expansion_query: str | None = None,
         additional_queries: list[str] | None = None,
         hyde_query: str | None = None,
+        domains: tuple[str, ...] | None = None,
     ):
         self.ensure_collection()
         queries = [question]
@@ -101,7 +102,10 @@ class HybridVectorStore:
         # Effective-date validation is repeated from PostgreSQL after recall. That
         # is authoritative and handles open-ended versions without Qdrant date
         # serialization assumptions.
-        effective_filter = models.Filter(must=[models.FieldCondition(key="status", match=models.MatchValue(value="PUBLISHED"))])
+        conditions = [models.FieldCondition(key="status", match=models.MatchValue(value="PUBLISHED"))]
+        if domains:
+            conditions.append(models.FieldCondition(key="domain", match=models.MatchAny(any=list(domains))))
+        effective_filter = models.Filter(must=conditions)
         # Qdrant server-side RRF combines independent dense and sparse rankings.
         prefetches = []
         for index in range(len(queries)):

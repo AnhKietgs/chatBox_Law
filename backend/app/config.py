@@ -18,7 +18,12 @@ class Settings(BaseSettings):
     admin_password: str = "change-me-now"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "Qwen3.5:2b"
+    # Low non-zero sampling avoids brittle repetitions while keeping legal
+    # answers, JSON schemas, and retrieval rewrites highly deterministic.
+    llm_temperature: float = Field(default=0.1, ge=0, le=1)
     public_rate_limit_per_minute: int = 20
+    admin_login_rate_limit_per_minute: int = 8
+    rate_limit_redis_enabled: bool = True
     # Kept only as the legacy fallback when Reranker.rerank() is called directly.
     # The production retrieval flow below uses a per-query percentile instead.
     confidence_threshold: float = 0.50
@@ -36,34 +41,58 @@ class Settings(BaseSettings):
     claim_support_threshold: float = 0.65
     extractive_fallback_threshold: float = 0.50
     index_batch_size: int = 32
-    retrieval_debug_logs: bool = False
+    # Legal structure-aware chunks are normally one Điều/Khoản/Điểm. Only an
+    # unusually long unit is split into numbered sub-chunks.
+    chunk_max_tokens: int = Field(default=450, ge=100, le=2000)
+    chunk_split_overlap_tokens: int = Field(default=40, ge=0, le=200)
+    chunk_audit_sample_size: int = Field(default=5, ge=0, le=20)
+    # Development enables readable top-k traces by default. Production stays
+    # quiet unless explicitly overridden with RETRIEVAL_DEBUG_LOGS=true.
+    app_env: str = "development"
+    retrieval_debug_logs: bool | None = None
     retrieval_debug_top_k: int = 8
     conversation_context_messages: int = 6
     conversation_context_max_chars: int = 3000
     contextualize_retrieval_with_llm: bool = True
     contextualize_timeout_seconds: float = 30
+    # Ignore old conversation context for a clearly different legal domain.
+    # This prevents a contextualizer from attaching a new topic to prior turns.
+    intent_shift_detection_enabled: bool = True
     retrieval_augmentation_enabled: bool = True
     retrieval_augmentation_model: str = ""
     retrieval_augmentation_timeout_seconds: float = 30
+    # A question that explicitly combines separate legal branches should be
+    # clarified before HyDE/MultiQuery amplifies only one of them.
+    mixed_domain_clarification_enabled: bool = True
     warm_models_on_startup: bool = True
     # ------------------------------------------------------------------ #
     # Context window overflow prevention                                   #
     # ------------------------------------------------------------------ #
-    # Token budget — estimate = ceil(len / 3.5), conservative for Vietnamese
+    # Token budget uses max(2 tokens/lexical item, len/2.5 chars): a
+    # conservative Vietnamese BPE bound which prefers early MapReduce.
     context_model_limit: int = 8192       # total token limit of the model
+    context_budget_safety_margin: float = Field(default=0.85, gt=0, le=1)
     context_reserved_output: int = 1024   # tokens set aside for generated answer
     context_overhead: int = 256           # JSON wrappers, system markers
     # Retrieval pool vs. injection limit
     retrieval_recall_pool: int = 30       # candidates retrieved for reranking
     retrieval_inject_limit: int = 7       # top provisions injected into prompt
-    # Map-Reduce (default OFF; enable via MAP_REDUCE_ENABLED=true in .env)
-    map_reduce_enabled: bool = False
+    # Map-Reduce is the normal overflow path. It preserves source IDs in a
+    # compact evidence digest so the final answer can still cite many sources.
+    # Set MAP_REDUCE_ENABLED=false only for constrained/offline environments.
+    map_reduce_enabled: bool = True
     map_batch_token_limit: int = 2000     # max tokens per map batch
     map_reduce_timeout_seconds: float = 60.0
     # Sliding window history + memory summary
     history_window_turns: int = 5         # recent turns kept verbatim
     memory_summary_enabled: bool = True   # summarise older turns via LLM
     memory_summary_max_tokens: int = 150  # target length of the summary paragraph
+
+    @property
+    def retrieval_debug_enabled(self) -> bool:
+        if self.retrieval_debug_logs is not None:
+            return self.retrieval_debug_logs
+        return self.app_env.strip().lower() in {"development", "dev", "local", "test"}
 
 
 @lru_cache

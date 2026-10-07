@@ -29,6 +29,9 @@ class LegalDocument(Base):
     code: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     title: Mapped[str] = mapped_column(String(500))
     jurisdiction: Mapped[str] = mapped_column(String(100), default="VN")
+    # Controlled metadata mirrored into Qdrant for server-side recall filters.
+    domain: Mapped[str] = mapped_column(String(50), default="general", index=True)
+    category: Mapped[str] = mapped_column(String(100), default="general", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     versions: Mapped[list["LegalVersion"]] = relationship(back_populates="document", cascade="all, delete-orphan")
 
@@ -63,6 +66,8 @@ class LegalProvision(Base):
     heading: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     content: Mapped[str] = mapped_column(Text)
     ordinal: Mapped[int] = mapped_column(Integer)
+    # 1 for a normal legal unit; >1 when an unusually long unit is split.
+    chunk_index: Mapped[int] = mapped_column(Integer, default=1)
     page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     vector_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     version: Mapped[LegalVersion] = relationship(back_populates="provisions")

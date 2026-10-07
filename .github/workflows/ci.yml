@@ -1,0 +1,25 @@
+name: Validate RAG contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  golden-contract:
+    name: Validate golden-set template and evaluator syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile evaluator scripts
+        run: python -m py_compile evaluation/golden.py evaluation/validate_golden.py evaluation/run_benchmark.py evaluation/run_ragas.py
+      - name: Verify the published template is intentionally not a release dataset
+        run: |
+          if python evaluation/validate_golden.py evaluation/golden_questions.example.jsonl; then
+            echo "Template must retain reviewer placeholders and must not be accepted as ground truth."
+            exit 1
+          fi
+          echo "Template correctly requires legal-expert review."

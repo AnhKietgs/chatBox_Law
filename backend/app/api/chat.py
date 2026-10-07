@@ -15,7 +15,14 @@ from ..services.answering import GroundedAnswerService, abstain
 from ..services.conversation import build_conversation_context
 from ..services.contextualization import contextualize_for_retrieval
 from ..services.memory import summarize_history
-from ..services.query_augmentation import augment_for_retrieval, clarification_response, needs_clarification
+from ..services.query_augmentation import (
+    augment_for_retrieval,
+    clarification_response,
+    detect_mixed_legal_domains,
+    detect_intent_shift,
+    mixed_domain_clarification_response,
+    needs_clarification,
+)
 from ..services.retrieval import LegalRetriever
 from ..models import ChatMessage, Conversation
 
@@ -66,6 +73,21 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         db.flush()
     settings = get_settings()
 
+    # Do this before contextualization and HyDE/MultiQuery.  Those retrieval
+    # helpers should not choose one branch of an explicitly mixed question and
+    # silently suppress the other (for example: labour + enterprise governance).
+    mixed_domains = detect_mixed_legal_domains(payload.question)
+    if settings.mixed_domain_clarification_enabled and mixed_domains.is_mixed:
+        answer = abstain(applied_date)
+        answer.answer = mixed_domain_clarification_response(mixed_domains.domains)
+        answer.warnings = [
+            "Không dùng HyDE/MultiQuery để tự chọn một lĩnh vực khi câu hỏi kết hợp nhiều lĩnh vực pháp lý."
+        ]
+        answer.conversation_id = save_turn(db, conversation, payload.question, answer.answer)
+        answer.latency = LatencyBreakdown(total_ms=round((perf_counter() - started) * 1000, 1))
+        logger.info("Chat abstained before retrieval because mixed legal domains were detected: %s", mixed_domains.domains)
+        return answer
+
     # ------------------------------------------------------------------ #
     # Strategy 4: Sliding window — only fetch the N recent turns          #
     # ------------------------------------------------------------------ #
@@ -82,6 +104,20 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         memory_summary=conversation.memory_summary,
         window_turns=settings.history_window_turns,
     )
+    prior_user_questions = [
+        str(message.content) for message in reversed(prior_messages)
+        if getattr(message, "role", "") == "user" and getattr(message, "content", None)
+    ]
+    intent_shift = detect_intent_shift(payload.question, prior_user_questions)
+    retrieval_context = conversation_context
+    if settings.intent_shift_detection_enabled and intent_shift.shifted:
+        # Keep the transcript for the UI/audit trail, but isolate this request
+        # from old context for contextualization, retrieval and generation.
+        retrieval_context = ""
+        logger.info(
+            "Chat intent shift detected: previous_domains=%s current_domains=%s; ignoring prior context for this turn",
+            intent_shift.previous_domains, intent_shift.current_domains,
+        )
     if needs_clarification(payload.question, bool(conversation_context)):
         answer = abstain(applied_date)
         answer.answer = clarification_response()
@@ -90,13 +126,13 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         answer.latency = LatencyBreakdown(total_ms=round((perf_counter() - started) * 1000, 1))
         logger.info("Chat abstained before retrieval because the question has an unresolved reference")
         return answer
-    contextualized = await contextualize_for_retrieval(payload.question, conversation_context)
+    contextualized = await contextualize_for_retrieval(payload.question, retrieval_context)
     augmentation = await augment_for_retrieval(contextualized.retrieval_query)
     retrieval = LegalRetriever(db).retrieve_with_metrics(
         payload.question,
         applied_date,
         inject_limit=settings.retrieval_inject_limit,
-        conversation_context=conversation_context,
+        conversation_context=retrieval_context,
         standalone_query=contextualized.retrieval_query,
         additional_queries=augmentation.query_variants,
         hyde_query=augmentation.hypothetical_document,
@@ -118,7 +154,7 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         re.IGNORECASE | re.UNICODE,
     )
     if (
-        not conversation_context
+        not retrieval_context
         and len(re.findall(r"\w+", payload.question)) <= 6
         and not _HAS_SPECIFIC_REF.search(payload.question)
         and retrieval.provisions
@@ -144,10 +180,14 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         payload.question,
         retrieval.provisions,
         applied_date,
-        conversation_context,
+        retrieval_context,
         fallback_minimum_score=retrieval.minimum_score,
         retrieval_query=contextualized.retrieval_query,
     )
+    if intent_shift.shifted:
+        generation.answer.warnings.append(
+            "Đã nhận diện chuyển chủ đề; câu trả lời này không dùng ngữ cảnh pháp lý của lượt chat trước."
+        )
     generation.answer.conversation_id = save_turn(db, conversation, payload.question, generation.answer.answer)
 
     # ------------------------------------------------------------------ #
@@ -207,8 +247,9 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
 
 
 @router.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_conversation(conversation_id: UUID, db: Session = Depends(get_db)) -> Response:
+def delete_conversation(conversation_id: UUID, request: Request, db: Session = Depends(get_db)) -> Response:
     """Delete an anonymous conversation and its messages on the user's request."""
+    enforce_public_rate_limit(request)
     # Explicit child-first bulk deletes make this endpoint idempotent when a
     # browser retries or two tabs try to delete the same conversation.
     db.execute(sql_delete(ChatMessage).where(ChatMessage.conversation_id == conversation_id))
