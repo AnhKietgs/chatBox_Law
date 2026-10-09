@@ -13,6 +13,7 @@ from ..versioning import is_effective
 from .query_expansion import expand_commercial_query
 from .query_augmentation import retrieval_domain_filters
 from .conversation import contextual_retrieval_query
+from .document_metadata import explicit_article_numbers, question_mentions_document
 from .prompt_security import scan_document_content
 from .vector_store import HybridVectorStore
 
@@ -118,15 +119,31 @@ class LegalRetriever:
             logger.info("Retrieval metadata filter: domains=%s", domains)
         if expanded.applied and retrieval_debug_enabled(settings):
             logger.info("Retrieval query expansion: original=%r expanded=%r", expanded.original, expanded.retrieval_query)
-        points = HybridVectorStore().search(
-            retrieval_query,
-            as_of.isoformat(),
+        vector_store = HybridVectorStore()
+        search_kwargs = dict(
+            question=retrieval_query,
+            as_of_iso=as_of.isoformat(),
             limit=recall_pool,
             expansion_query=expanded.retrieval_query if expanded.applied else None,
             additional_queries=additional_queries,
             hyde_query=hyde_query,
+        )
+        points = vector_store.search(
+            **search_kwargs,
             domains=domains or None,
         )
+        # Versions published before domain metadata was introduced have valid
+        # vectors but no `domain` payload. A strict Qdrant filter therefore
+        # returns zero even though PostgreSQL contains the correct provision.
+        # Retry recall without the payload filter only in that empty-result
+        # case; PostgreSQL remains authoritative and filters the rows below.
+        if domains and not points:
+            logger.warning(
+                "Retrieval domain filter returned no Qdrant points for %s; "
+                "retrying legacy recall without payload filter",
+                domains,
+            )
+            points = vector_store.search(**search_kwargs, domains=None)
         ids = [UUID(str(point.id)) for point in points]
         scores = {UUID(str(point.id)): float(point.score) for point in points}
         if not ids:
@@ -166,6 +183,10 @@ class LegalRetriever:
         for provision, version, document in rows:
             if not is_effective(version.effective_from, version.effective_to, as_of):
                 continue
+            # Mandatory after the legacy unfiltered retry: never let a result
+            # from another legal domain reach reranking or generation.
+            if domains and document.domain not in domains:
+                continue
             # Defence for data published before the ingest scanner existed.
             # It fails closed per provision, so a single suspicious chunk never
             # reaches the reranker or answer-model context.
@@ -181,6 +202,30 @@ class LegalRetriever:
             ))
         if blocked_legacy_count:
             logger.warning("Retrieval security filter excluded %d suspicious legacy provision(s)", blocked_legacy_count)
+
+        # A precise locator such as "Điều 301 LTM" is stronger than semantic
+        # similarity. If one document and one article are explicitly named and
+        # recalled, remove same-number provisions from other laws before the
+        # reranker and answer model can confuse them.
+        article_refs = explicit_article_numbers(retrieval_query)
+        mentioned_codes = {
+            item.document.code for item in valid
+            if question_mentions_document(retrieval_query, item.document.code, item.document.title)
+        }
+        if len(article_refs) == 1 and len(mentioned_codes) == 1:
+            requested_article = article_refs[0]
+            requested_code = next(iter(mentioned_codes))
+            exact = [
+                item for item in valid
+                if item.document.code == requested_code
+                and item.provision.article_no.casefold() == requested_article
+            ]
+            if exact:
+                logger.info(
+                    "Retrieval exact locator filter: document=%s article=%s kept=%d dropped=%d",
+                    requested_code, requested_article, len(exact), len(valid) - len(exact),
+                )
+                valid = exact
         log_top_k("hybrid-recall", question, valid, "rrf_score")
         retrieval_ms = (perf_counter() - retrieval_started) * 1000
         # bge-reranker-v2-m3 is deliberately applied after hybrid recall.

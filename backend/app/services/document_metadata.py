@@ -52,3 +52,24 @@ def infer_legacy_domain(document_code: str, title: str) -> str:
     if "blds" in text or "dân sự" in text:
         return "civil"
     return "general"
+
+
+def explicit_article_numbers(question: str) -> tuple[str, ...]:
+    """Return distinct article numbers explicitly written by the user."""
+    return tuple(dict.fromkeys(re.findall(r"\bđiều\s+(\d+[a-zđ]?)\b", question.casefold())))
+
+
+def question_mentions_document(question: str, document_code: str, title: str) -> bool:
+    """Match an explicit document name/code without guessing legal scope."""
+    normalized = " ".join(question.casefold().split())
+    code = document_code.strip().casefold()
+    title_normalized = " ".join(title.casefold().split())
+    title_without_year = re.sub(r"\s+\d{4}\s*$", "", title_normalized).strip()
+    if code and code in normalized:
+        return True
+    if title_normalized and title_normalized in normalized:
+        return True
+    if title_without_year and len(title_without_year) >= 5 and title_without_year in normalized:
+        return True
+    prefix = code.split("-", 1)[0]
+    return len(prefix) >= 3 and re.search(rf"(?<!\w){re.escape(prefix)}(?!\w)", normalized) is not None

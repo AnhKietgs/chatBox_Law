@@ -11,6 +11,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field, ValidationError
 from ..config import get_settings
 from ..schemas import ChatResponse, Citation, Claim
+from .document_metadata import explicit_article_numbers, question_mentions_document
 from .prompt_security import format_untrusted_documents
 if TYPE_CHECKING:
     from .retrieval import RetrievedProvision
@@ -142,6 +143,24 @@ def extractive_fallback(retrieved: list[RetrievedProvision], as_of: date, minimu
         warnings=["Câu trả lời được trích nguyên văn từ căn cứ pháp lý đã kiểm chứng.", "Thông tin có tính tham khảo, không thay thế tư vấn pháp lý cho tình huống cụ thể."],
         applied_as_of_date=as_of,
     )
+
+
+def exact_locator_sources(question: str, retrieved: list[RetrievedProvision]) -> list[RetrievedProvision]:
+    """Select sources only when one explicit document+article locator matches."""
+    article_refs = explicit_article_numbers(question)
+    mentioned_codes = {
+        item.document.code for item in retrieved
+        if question_mentions_document(question, item.document.code, item.document.title)
+    }
+    if len(article_refs) != 1 or len(mentioned_codes) != 1:
+        return []
+    article = article_refs[0]
+    document_code = next(iter(mentioned_codes))
+    return [
+        item for item in retrieved
+        if item.document.code == document_code
+        and item.provision.article_no.casefold() == article
+    ]
 
 
 def claims_are_supported(answer: ChatResponse, retrieved: list[RetrievedProvision]) -> bool:
@@ -432,11 +451,19 @@ class GroundedAnswerService:
         validation_started = perf_counter()
         answer = validate_model_answer(raw, retrieved, as_of, question)
         if answer.status == "abstained":
-            # LLM đã đánh giá nguồn không đủ để trả lời → trả abstain thật,
-            # không dùng extractive_fallback vì source top-1 có thể không
-            # liên quan đến câu hỏi hiện tại (chỉ liên quan đến context).
-            logger.info("LLM abstained — returning hard abstain (no extractive fallback)")
-            answer = abstain(as_of)
+            # Qwen 2B can overlook a provision even when the user explicitly
+            # named both its document and article. Return only that verified
+            # provision verbatim; ambiguous semantic matches still abstain.
+            exact_sources = exact_locator_sources(question, retrieved)
+            if exact_sources:
+                logger.warning(
+                    "LLM abstained despite exact locator %s Điều %s; using verified citation-first fallback",
+                    exact_sources[0].document.code, exact_sources[0].provision.article_no,
+                )
+                answer = extractive_fallback(exact_sources, as_of, minimum_score=0.0)
+            else:
+                logger.info("LLM abstained — returning hard abstain (no exact locator fallback)")
+                answer = abstain(as_of)
         elif not claims_are_supported(answer, retrieved):
             logger.warning("Rejected LLM output: a claim is not supported by its cited excerpt")
             answer = extractive_fallback(retrieved, as_of, fallback_minimum_score)

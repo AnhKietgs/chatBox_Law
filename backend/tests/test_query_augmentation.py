@@ -66,6 +66,8 @@ def test_converts_explicit_query_domains_to_qdrant_filter_values():
     assert retrieval_domain_filters("Mức phạt hợp đồng mua bán hàng hóa là bao nhiêu?") == ("commercial",)
     assert retrieval_domain_filters("Thành lập doanh nghiệp cần vốn điều lệ bao nhiêu?") == ("enterprise",)
     assert retrieval_domain_filters("Hợp đồng là gì?") == ()
+    assert retrieval_domain_filters("Điều 301 LTM quy định gì?") == ("commercial",)
+    assert retrieval_domain_filters("Điều 301 BLDS quy định gì?") == ("civil",)
 
 
 def test_detects_clear_cross_domain_topic_switch_and_keeps_same_domain_context():

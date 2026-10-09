@@ -12,7 +12,7 @@ from ..database import get_db
 from ..models import IngestionJob, JobStatus, LegalDocument, LegalProvision, LegalVersion, VersionStatus
 from ..schemas import ChatQuery, EvaluationTrace, JobSummary, ProvisionPage, ProvisionSummary, PublishRequest, ReviewSummary, TokenRequest, TokenResponse, VersionSummary
 from ..security import issue_token, require_admin
-from ..services.ingestion import publish_version, reindex_version
+from ..services.ingestion import publish_version
 from ..services.storage import ObjectStorage
 from ..services.vector_store import HybridVectorStore
 from ..services.document_metadata import normalize_category, normalize_domain
@@ -280,8 +280,8 @@ def publish(version_id: UUID, payload: PublishRequest, _: str = Depends(require_
     return {"version_id": str(version.id), "indexed_provisions": count, "status": version.status.value}
 
 
-@router.post("/versions/{version_id}/reindex")
-def reindex(version_id: UUID, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+@router.post("/versions/{version_id}/reindex", response_model=JobSummary, status_code=status.HTTP_202_ACCEPTED)
+def reindex(version_id: UUID, _: str = Depends(require_admin), db: Session = Depends(get_db)) -> JobSummary:
     """Re-embed và upsert lại Qdrant cho version đã publish, không cần re-upload PDF.
 
     Dùng khi text embedding thay đổi (ví dụ: thêm heading Điều vào khoản con)
@@ -292,11 +292,37 @@ def reindex(version_id: UUID, _: str = Depends(require_admin), db: Session = Dep
         raise HTTPException(status_code=404, detail="Không tìm thấy phiên bản")
     if version.status != VersionStatus.published:
         raise HTTPException(status_code=422, detail="Chỉ có thể reindex phiên bản đang xuất bản")
-    try:
-        count = reindex_version(db, version)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Reindex thất bại: {exc}") from exc
-    return {"version_id": str(version.id), "reindexed_provisions": count, "status": version.status.value}
+    active_job = db.scalar(
+        select(IngestionJob)
+        .where(
+            IngestionJob.version_id == version.id,
+            IngestionJob.status.in_([JobStatus.queued, JobStatus.running]),
+        )
+        .order_by(IngestionJob.created_at.desc())
+    )
+    if active_job:
+        return JobSummary(
+            id=active_job.id, version_id=active_job.version_id, status=active_job.status.value,
+            progress=active_job.progress, message=active_job.message, created_at=active_job.created_at,
+        )
+
+    job = IngestionJob(
+        version_id=version.id,
+        status=JobStatus.queued,
+        progress=0,
+        message="Đã xếp hàng lập chỉ mục lại",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    task = celery.send_task("lawrag.reindex_version", args=[str(job.id)])
+    job.celery_task_id = task.id
+    db.commit()
+    db.refresh(job)
+    return JobSummary(
+        id=job.id, version_id=job.version_id, status=job.status.value,
+        progress=job.progress, message=job.message, created_at=job.created_at,
+    )
 
 
 @router.post("/versions/{version_id}/withdraw")

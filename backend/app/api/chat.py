@@ -32,6 +32,46 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+async def generate_web_fallback(
+    question: str,
+    search_query: str,
+    applied_date: date,
+) -> tuple[ChatResponse | None, float, float]:
+    """Search and summarize unverified web sources after the RAG path declines.
+
+    Keeping this in one helper makes the pre-generation score gate and the
+    post-generation abstention gate behave identically.  The caller remains
+    responsible for persistence and the complete latency breakdown.
+    """
+    web_result = await WebSearchService().search(search_query)
+    if not web_result.sources:
+        return None, web_result.elapsed_ms, 0.0
+
+    # The web summarizer has no conversation history.  Give it the same
+    # standalone query used for search so references such as "Điều này" do
+    # not lose their nearest-turn binding after the RAG branch declines.
+    web_summary, used_web_sources, web_llm_ms = await WebSearchAnswerService().generate(
+        search_query,
+        web_result.sources,
+    )
+    if not web_summary or not used_web_sources:
+        return None, web_result.elapsed_ms, web_llm_ms
+
+    answer = abstain(applied_date)
+    answer.source_mode = "web_search"
+    answer.answer = (
+        "Tôi không có đủ thông tin để cung cấp câu trả lời có căn cứ pháp lý từ kho văn bản đã duyệt. "
+        "Tuy nhiên, dưới đây là thông tin tôi tìm được trên web (chưa được xác minh):\n\n"
+        f"{web_summary}"
+    )
+    answer.warnings = [
+        "Kết quả dưới đây lấy từ web, chưa phải căn cứ pháp lý đã được quản trị viên duyệt.",
+        "Hãy kiểm tra nguồn gốc hoặc bổ sung văn bản chính thức vào kho trước khi dùng cho quyết định pháp lý.",
+    ]
+    answer.web_sources = used_web_sources
+    return answer, web_result.elapsed_ms, web_llm_ms
+
+
 def save_turn(db: Session, conversation: Conversation, question: str, answer: str) -> UUID:
     """Persist a turn; recover if the client deleted this anonymous chat concurrently."""
     # Preserve the scalar before commit/rollback expires ORM attributes. In the
@@ -148,7 +188,10 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
     #   1. Không có conversation context (standalone)                     #
     #   2. ≤ 6 từ trong câu hỏi gốc                                      #
     #   3. Không có số điều cụ thể / mã luật trong câu hỏi               #
-    #   4. Retrieval trả về ≥ 2 văn bản khác nhau (mixed domain)         #
+    #   4. Top reranker score ≥ web_search_rag_threshold                  #
+    #      → Nếu score thấp hơn ngưỡng, câu hỏi không phải pháp lý      #
+    #        (VD: hỏi phim, truyện) → bỏ qua gate, để web fallback xử lý #
+    #   5. Retrieval trả về ≥ 2 văn bản khác nhau (mixed domain)         #
     # ------------------------------------------------------------------ #
     _HAS_SPECIFIC_REF = re.compile(
         r"\b(điều\s+\d+|khoản\s+\d+|ltm|blds|blhs|bllđ|blds|luật\s+\w+)\b",
@@ -159,11 +202,13 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         and len(re.findall(r"\w+", payload.question)) <= 6
         and not _HAS_SPECIFIC_REF.search(payload.question)
         and retrieval.provisions
+        and retrieval.provisions[0].score >= settings.web_search_rag_threshold
         and len({p.document.code for p in retrieval.provisions}) > 1
     ):
         logger.info(
-            "Chat ambiguous standalone query (short=%d words, mixed domains=%s) → clarification",
+            "Chat ambiguous standalone query (short=%d words, top_score=%.4f, mixed domains=%s) → clarification",
             len(re.findall(r"\w+", payload.question)),
+            retrieval.provisions[0].score,
             {p.document.code for p in retrieval.provisions},
         )
         answer = abstain(applied_date)
@@ -193,40 +238,27 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
             f"{top_rag_score:.4f}" if top_rag_score is not None else "none",
             settings.web_search_rag_threshold,
         )
-        web_result = await WebSearchService().search(contextualized.retrieval_query)
-        if web_result.sources:
-            web_summary, used_web_sources, web_llm_ms = await WebSearchAnswerService().generate(
-                payload.question,
-                web_result.sources,
+        answer, web_search_ms, web_llm_ms = await generate_web_fallback(
+            payload.question,
+            contextualized.retrieval_query,
+            applied_date,
+        )
+        if answer is not None:
+            answer.conversation_id = save_turn(db, conversation, payload.question, answer.answer)
+            answer.latency = LatencyBreakdown(
+                contextualization_ms=round(contextualized.llm_ms, 1),
+                query_augmentation_ms=round(augmentation.llm_ms, 1),
+                retrieval_ms=round(retrieval.retrieval_ms, 1),
+                rerank_ms=round(retrieval.rerank_ms, 1),
+                web_search_ms=round(web_search_ms, 1),
+                llm_ms=round(web_llm_ms, 1),
+                total_ms=round((perf_counter() - started) * 1000, 1),
             )
-            if web_summary and used_web_sources:
-                answer = abstain(applied_date)
-                answer.source_mode = "web_search"
-                answer.answer = (
-                    "Tôi không có đủ thông tin để cung cấp câu trả lời có căn cứ pháp lý từ kho văn bản đã duyệt. "
-                    "Tuy nhiên, dưới đây là thông tin tôi tìm được trên web (chưa được xác minh):\n\n"
-                    f"{web_summary}"
-                )
-                answer.warnings = [
-                    "Kết quả dưới đây lấy từ web, chưa phải căn cứ pháp lý đã được quản trị viên duyệt.",
-                    "Hãy kiểm tra nguồn gốc hoặc bổ sung văn bản chính thức vào kho trước khi dùng cho quyết định pháp lý.",
-                ]
-                answer.web_sources = used_web_sources
-                answer.conversation_id = save_turn(db, conversation, payload.question, answer.answer)
-                answer.latency = LatencyBreakdown(
-                    contextualization_ms=round(contextualized.llm_ms, 1),
-                    query_augmentation_ms=round(augmentation.llm_ms, 1),
-                    retrieval_ms=round(retrieval.retrieval_ms, 1),
-                    rerank_ms=round(retrieval.rerank_ms, 1),
-                    web_search_ms=round(web_result.elapsed_ms, 1),
-                    llm_ms=round(web_llm_ms, 1),
-                    total_ms=round((perf_counter() - started) * 1000, 1),
-                )
-                logger.info(
-                    "Chat returned unverified web fallback: sources=%d total=%.1fms",
-                    len(used_web_sources), answer.latency.total_ms,
-                )
-                return answer
+            logger.info(
+                "Chat returned unverified web fallback: sources=%d total=%.1fms",
+                len(answer.web_sources), answer.latency.total_ms,
+            )
+            return answer
         logger.info("Web fallback yielded no usable summary; continuing to safe RAG abstention path")
 
     generation = await GroundedAnswerService().generate(
@@ -237,6 +269,47 @@ async def query(payload: ChatQuery, request: Request, db: Session = Depends(get_
         fallback_minimum_score=retrieval.minimum_score,
         retrieval_query=contextualized.retrieval_query,
     )
+
+    # A strong retrieval score only proves that a candidate looks relevant;
+    # the grounded answer model can still decline after checking the actual
+    # legal text.  In that case RAG has genuinely been exhausted, so perform a
+    # second, explicit web fallback instead of returning a silent abstention.
+    # This cannot make the system "lazy RAG": retrieval, reranking and grounded
+    # generation have all completed before this branch is reachable.
+    if generation.answer.status == "abstained":
+        logger.info(
+            "Grounded generation abstained after RAG; attempting post-generation web fallback"
+        )
+        web_answer, web_search_ms, web_llm_ms = await generate_web_fallback(
+            payload.question,
+            contextualized.retrieval_query,
+            applied_date,
+        )
+        if web_answer is not None:
+            if intent_shift.shifted:
+                web_answer.warnings.append(
+                    "Đã nhận diện chuyển chủ đề; lượt này không dùng ngữ cảnh pháp lý của lượt chat trước."
+                )
+            web_answer.conversation_id = save_turn(db, conversation, payload.question, web_answer.answer)
+            web_answer.latency = LatencyBreakdown(
+                contextualization_ms=round(contextualized.llm_ms, 1),
+                query_augmentation_ms=round(augmentation.llm_ms, 1),
+                retrieval_ms=round(retrieval.retrieval_ms, 1),
+                rerank_ms=round(retrieval.rerank_ms, 1),
+                web_search_ms=round(web_search_ms, 1),
+                llm_ms=round(generation.llm_ms + web_llm_ms, 1),
+                citation_validation_ms=round(generation.citation_validation_ms, 1),
+                token_budget_ms=round(generation.token_budget_ms, 1),
+                map_reduce_ms=round(generation.map_reduce_ms, 1),
+                total_ms=round((perf_counter() - started) * 1000, 1),
+            )
+            logger.info(
+                "Chat returned post-generation web fallback: sources=%d total=%.1fms",
+                len(web_answer.web_sources), web_answer.latency.total_ms,
+            )
+            return web_answer
+        logger.info("Post-generation web fallback yielded no usable summary; returning safe abstention")
+
     if intent_shift.shifted:
         generation.answer.warnings.append(
             "Đã nhận diện chuyển chủ đề; câu trả lời này không dùng ngữ cảnh pháp lý của lượt chat trước."

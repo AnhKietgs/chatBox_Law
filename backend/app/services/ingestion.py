@@ -5,6 +5,7 @@ import logging
 import math
 import random
 from datetime import timedelta
+from collections.abc import Callable
 from uuid import UUID
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -285,6 +286,7 @@ def _build_embedding_records(version: LegalVersion) -> list[tuple[UUID, str, dic
 def _upsert_records(
     records: list[tuple[UUID, str, dict]],
     label: str,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> None:
     """Chia batch và upsert vào Qdrant. label dùng cho log."""
     vector_store = HybridVectorStore()
@@ -292,7 +294,10 @@ def _upsert_records(
     total = len(records)
     for start in range(0, total, batch_size):
         vector_store.upsert_many(records[start:start + batch_size])
-        logger.info("%s: upserted %d/%d provisions", label, min(start + batch_size, total), total)
+        processed = min(start + batch_size, total)
+        logger.info("%s: upserted %d/%d provisions", label, processed, total)
+        if on_progress:
+            on_progress(processed, total)
 
 
 def reindex_version(db: Session, version: LegalVersion) -> int:
@@ -305,6 +310,53 @@ def reindex_version(db: Session, version: LegalVersion) -> int:
     _upsert_records(records, f"Reindex version {version.id}")
     db.commit()
     return len(records)
+
+
+def reindex_version_job(db: Session, job_id: UUID) -> None:
+    """Run a published-version reindex as a trackable Celery job.
+
+    Embedding thousands of provisions can take many minutes on CPU. Keeping
+    that work outside the HTTP request prevents nginx/browser timeouts while
+    exposing batch progress through the existing admin job endpoint.
+    """
+    job = db.get(IngestionJob, job_id)
+    if not job:
+        raise ValueError("Không tìm thấy reindex job")
+    version = db.get(LegalVersion, job.version_id)
+    if not version:
+        raise ValueError("Không tìm thấy phiên bản văn bản")
+    if version.status != VersionStatus.published:
+        raise ValueError("Chỉ có thể reindex phiên bản đang xuất bản")
+
+    job.status = JobStatus.running
+    job.progress = 2
+    job.message = "Đang chuẩn bị dữ liệu để lập chỉ mục lại"
+    db.commit()
+    try:
+        records = _build_embedding_records(version)
+        total = len(records)
+        if not total:
+            raise ValueError("Phiên bản không có đơn vị pháp lý để lập chỉ mục")
+
+        def update_progress(processed: int, record_count: int) -> None:
+            job.progress = min(99, 5 + round(processed / record_count * 94))
+            job.message = f"Đang lập chỉ mục lại: {processed}/{record_count} đơn vị"
+            db.commit()
+
+        _upsert_records(records, f"Reindex version {version.id}", update_progress)
+        job.status = JobStatus.succeeded
+        job.progress = 100
+        job.message = f"Đã lập chỉ mục lại {total} đơn vị pháp lý"
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        failed_job = db.get(IngestionJob, job_id)
+        if failed_job:
+            failed_job.status = JobStatus.failed
+            failed_job.message = f"Lập chỉ mục lại thất bại: {exc}"
+            db.commit()
+        logger.exception("Reindex job failed: job_id=%s version_id=%s", job_id, version.id)
+        raise
 
 
 def publish_version(db: Session, version: LegalVersion) -> int:

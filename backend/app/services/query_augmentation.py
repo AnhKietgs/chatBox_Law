@@ -79,10 +79,10 @@ _LEGAL_DOMAIN_SIGNALS: dict[str, tuple[str, ...]] = {
     ),
     "thương mại": (
         "mua bán hàng hóa", "hàng hóa", "thương mại", "đại lý thương mại",
-        "nhượng quyền", "logistics", "hợp đồng mua bán",
+        "nhượng quyền", "logistics", "hợp đồng mua bán", "ltm",
     ),
     "dân sự": (
-        "bộ luật dân sự", "dân sự", "giao dịch dân sự", "thừa kế",
+        "bộ luật dân sự", "dân sự", "giao dịch dân sự", "thừa kế", "blds",
     ),
     "gia đình": (
         "hôn nhân", "ly hôn", "nuôi con", "cấp dưỡng",

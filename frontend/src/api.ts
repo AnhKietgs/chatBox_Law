@@ -71,9 +71,10 @@ export async function publish(token: string, id: string, reviewedStructureHash: 
   const response = await fetch(`/api/v1/admin/versions/${id}/publish`, { method: 'POST', headers: { ...jsonHeaders, Authorization: `Bearer ${token}` }, body: JSON.stringify({ reviewed_structure_hash: reviewedStructureHash }) })
   if (!response.ok) throw await responseError(response, 'Không thể xuất bản')
 }
-export async function reindex(token: string, id: string) {
+export async function reindex(token: string, id: string): Promise<Job> {
   const response = await fetch(`/api/v1/admin/versions/${id}/reindex`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } })
   if (!response.ok) throw await responseError(response, 'Không thể lập chỉ mục lại')
+  return response.json()
 }
 export async function withdraw(token: string, id: string) {
   const response = await fetch(`/api/v1/admin/versions/${id}/withdraw`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } })

@@ -31,6 +31,16 @@ services:
   ollama:
     image: ollama/ollama:latest
     volumes: [ollama_data:/root/.ollama]
+    # GPU passthrough — requires NVIDIA drivers on the host and Docker Desktop
+    # with WSL2 backend (Settings → Resources → GPU support enabled).
+    # The ollama/ollama:latest image includes CUDA; no image change needed.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     # Pull the configured model once after startup: docker compose exec ollama ollama pull Qwen3.5:2b
 
   api:

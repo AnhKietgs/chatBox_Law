@@ -70,3 +70,14 @@ def test_reranker_uses_the_current_batch_percentile(monkeypatch):
     # np.percentile([.12, .40, .62, .74, .92], 70) = .716
     assert round(threshold, 3) == 0.716
     assert [item.score for item in kept] == [0.92, 0.74]
+
+
+def test_domain_filter_values_match_document_metadata():
+    """The PostgreSQL legacy guard compares the same canonical domain values
+    that query augmentation sends to Qdrant."""
+    from app.services.query_augmentation import retrieval_domain_filters
+
+    domains = retrieval_domain_filters("Mức phạt hợp đồng mua bán hàng hóa tối đa là bao nhiêu?")
+    assert domains == ("commercial",)
+    assert "commercial" in domains
+    assert "civil" not in domains
